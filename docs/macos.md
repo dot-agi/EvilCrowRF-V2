@@ -202,8 +202,10 @@ confirmed. The Flutter GUI bootloader/restart controls passed, including SD
 initialization after restart. GUI backup attempts rejected unreadable flash
 IDs before writing. After a full power cycle, the full 4 MiB backup verified
 against the device and exported with a valid checksum sidecar; two serial-read
-retries recovered during that run. Confirmed GUI firmware installation remains
-pending.
+retries recovered during that run. The final independent app then imported
+that exported backup, previewed and wrote the selected 1.1.4 application image,
+verified its device hash, and restarted successfully. Post-update USB receive,
+Bluetooth reconnect and SD checks remain pending.
 
 Backups include internal firmware and settings, but exclude the microSD card.
 Keep them private. The backup reader uses small requests, bounded retries, and

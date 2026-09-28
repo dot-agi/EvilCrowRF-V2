@@ -18,7 +18,7 @@ The device used for these live tests ran separately built **1.1.4** firmware,
 
 | Check | Recorded result | Limit |
 | --- | --- | --- |
-| USB firmware installation | Verified full 4 MiB backup; application written to app0 at `0x10000`; device MD5 matched | Unified Flutter GUI update is pending |
+| CLI USB firmware installation | Verified full 4 MiB backup; application written to app0 at `0x10000`; device MD5 matched | Application partition only |
 | USB identity and status | Correct board identity; status commands respond | Does not test RF sensitivity |
 | USB RX with Flutter connected over BLE | 5,685 host bytes in 12 seconds; 2,374 bytes in 5 seconds | Earlier 1.1.4 image identified below; data may be noise |
 | RX stop and cleanup | Both combined runs acknowledged stop; final state inactive and not streaming | Host byte counts exclude data outside the capture window |
@@ -32,7 +32,8 @@ The device used for these live tests ran separately built **1.1.4** firmware,
 | Flutter packaged receive/export | Captured 2,393 raw bytes and exported them through the native save panel | Demodulated data may be noise |
 | Flutter packaged GNU capture/export | Captured 2,376 synthetic complex samples and exported 19,008 bytes in complex64 format | GNU Radio runtime was not used |
 | Flutter packaged URH bridge | Local TCP client received 2,374 bytes / 1,187 samples excluding padding; fragmented retuning command and Stop passed | External URH desktop UI was not used |
-| Flutter GUI backup/export | Full 4 MiB read and device-MD5 verification passed; exported SHA-256 sidecar names and matches the saved image | Two serial-read retries recovered; GUI firmware update is pending |
+| Flutter GUI backup/export | Full 4 MiB read and device-MD5 verification passed; exported SHA-256 sidecar names and matches the saved image | Two serial-read retries recovered |
+| Flutter GUI firmware installation | Final independent package imported the exported backup, previewed the selected image, wrote 1,205,888 bytes to app0 at `0x10000`, verified its hash and restarted | Post-update USB/BLE/SD checks are pending |
 | Flutter critical-operation Quit guard | Cmd-Q displayed Keep Open during the active backup; backup continued to completion | Normal application quit, not forced process termination |
 | Flutter GUI backup preflight | Rejected unreadable flash IDs `0xffffff` and `0x000000`; no flash write occurred | A full power cycle was needed before the successful backup |
 | Button mapping persistence | Mapping survived restart; original mappings restored | No physical button press tested |
@@ -117,8 +118,14 @@ backup/export. After a full power cycle, the backup completed with two recovered
 serial-read errors, matched the device MD5, and exported 4,194,304 bytes plus a
 valid SHA-256 sidecar. Cmd-Q during that backup showed the native Keep Open
 guard; the backup continued and completed. Earlier attempts correctly rejected
-unreadable flash IDs before any write. Confirmed GUI firmware installation and
-a hardware smoke check of the final rebuilt helper remain pending.
+unreadable flash IDs before any write.
+
+The final independent app package then imported that exported backup through
+the native folder picker and selected the 1,205,888-byte firmware image whose
+SHA-256 is recorded above. The confirmation showed that exact hash and app0 at
+`0x10000`. The write transferred 683,460 compressed bytes in 67.1 seconds,
+verified the device hash, restarted the board, and returned `ok: true`.
+Post-update USB receive, Bluetooth reconnect and SD checks remain pending.
 
 The app release was rebuilt directly from `main` plus this app/host change set,
 without the firmware PR. The build generated its own USB helper and passed
@@ -172,7 +179,7 @@ are reported and retained.
 | Known-signal capture and protocol decoding | An owned transmitter with known frequency, modulation, and payload |
 | Physical buttons | Press each user button and verify the selected action; test RESET separately |
 | URH / GNU Radio desktop integration | Run the external application or runtime flowgraph; local adapter transport has passed |
-| Unified Flutter USB Tools | Complete a GUI-selected update with the fresh verified backup, then smoke-test the final rebuilt helper against the device |
+| Post-update device checks | Smoke-test USB receive, Bluetooth reconnect and SD state after the verified GUI update |
 | BLE OTA | Complete transfer, validation, reboot, and version check with a fresh backup |
 | Replay, emulation, brute-force, nRF HID/string/Ducky, jamming | Scoped owned receiver and isolated RF setup appropriate to the operation |
 | Factory reset and SD format | Explicit destructive test with a verified backup and restoration plan |
