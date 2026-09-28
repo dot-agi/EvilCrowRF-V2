@@ -68,9 +68,12 @@ def find_evilcrow_port() -> str:
 class URHBridge:
     """RTL-TCP compatible bridge for EvilCrow RF v2."""
 
-    def __init__(self, serial_port: str, tcp_port: int = 1234):
+    def __init__(self, serial_port: str, tcp_port: int = 1234, sample_format: str = 'bytes'):
+        if sample_format not in ('bytes', 'bits'):
+            raise ValueError('sample_format must be bytes or bits')
         self.serial_port = serial_port
         self.tcp_port = tcp_port
+        self.sample_format = sample_format
         self.ser: serial.Serial = None
         self.server: socket.socket = None
         self.client: socket.socket = None
@@ -179,6 +182,24 @@ class URHBridge:
             client.sendall(header)
             self.log('Sent RTL-TCP header (12 bytes)')
 
+            commands = bytearray()
+            if self.sample_format == 'bits':
+                # URH 2.10 reads its header in one recv and requires exactly
+                # 12 bytes. Wait for its settings before sending any samples.
+                # Cancellation stays bounded even if a client never responds.
+                deadline = time.monotonic() + 10
+                while len(commands) < 5 and not self._stop_requested.is_set():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('RTL-TCP client did not send receiver settings')
+                    ready, _, _ = select.select([client], [], [], 0.1)
+                    if ready:
+                        packet = client.recv(1024)
+                        if not packet:
+                            return
+                        commands.extend(packet)
+                while len(commands) >= 5 and not self._stop_requested.is_set():
+                    self.handle_rtl_command(bytes(commands[:5]))
+                    del commands[:5]
             with self._device_lock:
                 if self._stop_requested.is_set():
                     return
@@ -186,7 +207,6 @@ class URHBridge:
                     raise RuntimeError('Receiver did not acknowledge RX start')
                 self._rx_active = True
                 self.running = True
-            commands = bytearray()
             last_log = time.monotonic()
             while self.running and not self._stop_requested.is_set():
                 ready, _, _ = select.select([client], [], [], 0)
@@ -203,12 +223,18 @@ class URHBridge:
                         break
                     raw = self.device.read_raw(512, timeout=0.02)
                 if raw:
-                    iq = bytearray(len(raw) * 2)
-                    iq[::2] = raw
-                    iq[1::2] = b'\x7f' * len(raw)
+                    if self.sample_format == 'bits':
+                        # Real amplitude 0/1, Q=0, for MSB-first demodulated
+                        # bits. This reconstructs no RF phase or missing time.
+                        iq = bytes(value for byte in raw for shift in range(7, -1, -1)
+                                   for value in (254 if byte & (1 << shift) else 127, 127))
+                    else:
+                        iq = bytearray(len(raw) * 2)
+                        iq[::2] = raw
+                        iq[1::2] = b'\x7f' * len(raw)
                     client.sendall(iq)
-                    sample_count += len(raw)
-                else:
+                    sample_count += len(iq) // 2
+                elif self.sample_format == 'bytes':
                     client.sendall(b'\x7f\x7f' * 64)
                 if time.monotonic() - last_log >= 5:
                     self.log(f'  Streamed {sample_count} demodulated samples')
@@ -289,10 +315,11 @@ def main():
                         help='Serial port (auto-detect if omitted)')
     parser.add_argument('--tcp-port', type=int, default=1234,
                         help='TCP server port (default: 1234)')
+    parser.add_argument('--sample-format', choices=('bytes', 'bits'), default='bytes')
     args = parser.parse_args()
 
     port = args.port or find_evilcrow_port()
-    bridge = URHBridge(serial_port=port, tcp_port=args.tcp_port)
+    bridge = URHBridge(serial_port=port, tcp_port=args.tcp_port, sample_format=args.sample_format)
     bridge.run()
 
 

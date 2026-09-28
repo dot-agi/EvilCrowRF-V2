@@ -19,11 +19,124 @@ import '../services/file_parsers/file_parser_factory.dart';
 import '../services/cc1101/cc1101_calculator.dart';
 import '../services/cc1101/cc1101_values.dart';
 import '../services/binary_message_parser.dart';
+import '../services/ota_firmware_image.dart';
+import '../services/ota_transfer_service.dart';
+import '../services/ota_operation_guard.dart';
 // import 'log_provider.dart'; // Unused import removed
 
 class BleProvider extends ChangeNotifier {
   bool _disposed = false;
   bool _isConnecting = false;
+  final _otaEvents = StreamController<OtaEvent>.broadcast(sync: true);
+  OtaTransferService? _otaTransfer;
+  bool _otaExclusive = false;
+  bool _otaReconnecting = false;
+  int _versionResponses = 0;
+  int _nrfStatusResponses = 0;
+  int _sdrStatusResponses = 0;
+
+  OtaTransferService get otaTransfer => _otaTransfer ??= OtaTransferService(
+    events: _otaEvents.stream,
+    write: _writeOtaCommand,
+    maximumPacketBytes: () => (connectedDevice?.mtuNow ?? 23) - 3,
+    rebootAndReconnect: _rebootOtaAndReconnect,
+    setQuitGuard: setOtaOperationGuard,
+  );
+
+  Future<void> _waitForOtaCondition(bool Function() condition, String description,
+      {Duration timeout = const Duration(seconds: 10)}) async {
+    final done = Completer<void>();
+    void check() {
+      if (!done.isCompleted && condition()) done.complete();
+    }
+    addListener(check);
+    check();
+    try {
+      await done.future.timeout(timeout,
+          onTimeout: () => throw TimeoutException(description));
+    } finally {
+      removeListener(check);
+    }
+  }
+
+  Future<void> _writeOtaCommand(Uint8List command) async {
+    final characteristic = txCharacteristic;
+    if (!isConnected || characteristic == null) throw StateError('Device not connected');
+    // The current firmware characteristic supports WRITE, not WRITE_NR.
+    await characteristic.write(command, withoutResponse: false, timeout: 10);
+  }
+
+  Future<OtaResult> installOtaFirmware(OtaFirmwareImage image,
+      {required String expectedVersion}) async {
+    if (_otaExclusive) throw StateError('A firmware update is already active');
+    if (!isConnected || _disposed) throw StateError('Connect to the device first');
+    _otaExclusive = true;
+    try {
+      final previous = cc1101Modules;
+      final previousNrf = _nrfStatusResponses;
+      final previousSdr = _sdrStatusResponses;
+      final fresh = _waitForOtaCondition(() => !identical(previous, cc1101Modules) &&
+          _nrfStatusResponses > previousNrf && _sdrStatusResponses > previousSdr,
+          'Could not confirm idle radio state before OTA');
+      fresh.ignore();
+      await _writeOtaCommand(FirmwareBinaryProtocol.createSdrGetStatusCommand());
+      await _writeOtaCommand(FirmwareBinaryProtocol.createGetStateCommand());
+      await fresh;
+      if (_disposed) throw StateError('Controller closed before OTA started');
+      if (cc1101Modules == null || cc1101Modules!.length != 2 ||
+          cc1101Modules!.any((module) => module['mode'] != 'Idle') ||
+          nrfScanning || nrfAttacking || nrfSpectrumRunning || nrfJammerRunning ||
+          sdrModeActive) {
+        throw StateError('Stop all radio operations before starting OTA.');
+      }
+      otaComplete = false;
+      otaErrorMessage = null;
+      otaProgress = 0;
+      otaBytesWritten = 0;
+      return await otaTransfer.install(image, expectedVersion: expectedVersion);
+    } finally {
+      _otaExclusive = false;
+      _otaReconnecting = false;
+    }
+  }
+
+  Future<String> _rebootOtaAndReconnect() async {
+    final device = connectedDevice;
+    if (device == null) throw StateError('Device disconnected before OTA restart');
+    _otaRebootPending = false; // This operation owns reconnect and verification.
+    _otaReconnectTimer?.cancel();
+    _otaReconnecting = true;
+    final disconnected = _waitForOtaCondition(() => !isConnected,
+        'Device did not disconnect after the OTA restart command',
+        timeout: const Duration(seconds: 15));
+    disconnected.ignore();
+    await _writeOtaCommand(FirmwareBinaryProtocol.createOtaRebootCommand());
+    await disconnected;
+    await Future<void>.delayed(const Duration(seconds: 3));
+    Object? lastError;
+    // Native connect/discovery/write calls each have their own deadlines.
+    // Await them to completion so a timed-out wrapper never leaves a second
+    // connection attempt running after OTA releases ownership.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (_disposed) throw StateError('Controller closed during OTA restart');
+      final previousVersion = _versionResponses;
+      _firmwareVersion = '';
+      _settingsSynced = false;
+      await connectToDevice(device);
+      try {
+        if (!isConnected) throw StateError(statusMessage);
+        await _waitForOtaCondition(() => isConnected && _settingsSynced &&
+            _versionResponses > previousVersion && _firmwareVersion.isNotEmpty,
+            'No fresh firmware version received after OTA restart');
+        return _firmwareVersion;
+      } catch (error) {
+        lastError = error;
+        await disconnect();
+      }
+      if (attempt == 0) await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    throw StateError('Firmware written, but reconnect/version verification failed: $lastError');
+  }
 
   @protected
   Stream<BluetoothAdapterState> get adapterStates => FlutterBluePlus.adapterState;
@@ -713,6 +826,9 @@ class BleProvider extends ChangeNotifier {
   }
 
   void _resetConnectionState() {
+    if (_otaExclusive && !_otaEvents.isClosed) {
+      _otaEvents.add(const OtaEvent.disconnected());
+    }
     // Cancel BLE stream subscriptions to prevent leaks on reconnect
     _connectionStateSubscription?.cancel();
     _connectionStateSubscription = null;
@@ -762,6 +878,9 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> disconnect() async {
+    if (_otaExclusive && !_otaReconnecting && !_disposed) {
+      throw StateError('Wait for OTA to finish or cancel the transfer first.');
+    }
     if (connectedDevice != null) {
       try {
         _log('info', 'Disconnecting from device', details: 'Device: ${connectedDevice!.name}');
@@ -880,6 +999,7 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> sendCommand(String command) async {
+    if (_otaExclusive) throw StateError('OTA owns the Bluetooth connection');
     if (!isConnected || txCharacteristic == null) {
       statusMessage = 'Not connected';
       _log('error', 'Failed to send command: Not connected', details: 'Command: $command');
@@ -2012,6 +2132,7 @@ class BleProvider extends ChangeNotifier {
           notifyListeners();
           break;
         case 'SdrStatus':
+          _sdrStatusResponses++;
           final d = data['data'] as Map?;
           if (d != null) {
             sdrModeActive = d['active'] == true;
@@ -2027,23 +2148,32 @@ class BleProvider extends ChangeNotifier {
           final d = data['data'] as Map?;
           otaProgress = d?['percentage'] ?? 0;
           otaBytesWritten = d?['bytesWritten'] ?? 0;
+          _otaEvents.add(OtaEvent.progress(otaBytesWritten, d?['totalSize'] ?? 0));
           _log('debug', 'OTA progress', details: '$otaProgress%');
           notifyListeners();
           break;
         case 'OtaComplete':
+          if ((data['data']?['status'] ?? 0) != 0) {
+            _otaEvents.add(const OtaEvent.error('Device rejected OTA verification'));
+            break;
+          }
           otaComplete = true;
+          _otaEvents.add(const OtaEvent.complete());
           _log('info', 'OTA complete');
-          _notify('success', 'Firmware update complete!');
+          _notify('info', 'Firmware verified; restart verification follows.');
           notifyListeners();
           break;
         case 'OtaError':
           otaErrorMessage = data['data']?['message'] ?? 'Unknown error';
+          _otaEvents.add(OtaEvent.error(otaErrorMessage));
           _log('error', 'OTA error', details: otaErrorMessage ?? '');
           _notify('error', 'OTA error: $otaErrorMessage');
           notifyListeners();
           break;
         case 'CommandResult':
-          // Generic command result - no special handling needed
+          if (data['data']?['success'] == true) {
+            _otaEvents.add(const OtaEvent.commandSuccess());
+          }
           break;
         default:
           print('Unknown response type: $type');
@@ -3103,6 +3233,11 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> sendBinaryCommand(Uint8List command, {bool withoutResponse = false}) async {
+    if (_otaExclusive && !(_otaReconnecting && command.length > 7 &&
+        (command[7] == FirmwareBinaryProtocol.MSG_GET_STATE ||
+         command[7] == FirmwareBinaryProtocol.MSG_SET_TIME))) {
+      throw StateError('OTA owns the Bluetooth connection');
+    }
     if (!isConnected || txCharacteristic == null) {
       throw Exception('Device not connected');
     }
@@ -3888,6 +4023,7 @@ class BleProvider extends ChangeNotifier {
 
   /// Handle firmware version info (0xC2) — received on every getState.
   void _handleVersionInfo(Map<String, dynamic> data) {
+    _versionResponses++;
     _fwMajor = data['major'] ?? 0;
     _fwMinor = data['minor'] ?? 0;
     _fwPatch = data['patch'] ?? 0;
@@ -3938,6 +4074,7 @@ class BleProvider extends ChangeNotifier {
 
   /// Handle nRF24 module status (0xCA) — received on GetState.
   void _handleNrfModuleStatus(Map<String, dynamic> data) {
+    _nrfStatusResponses++;
     nrfPresent = data['present'] ?? false;
     nrfInitialized = data['initialized'] ?? false;
     // activeState: 0=idle, 1=jamming, 2=scanning, 3=attacking, 4=spectrum
@@ -4849,6 +4986,7 @@ class BleProvider extends ChangeNotifier {
     _disposed = true;
     _logCallback = null;
     _notificationCallback = null;
+    _otaTransfer?.dispose();
     _otaRebootPending = false;
     // Cancel all BLE stream subscriptions
     _adapterStateSubscription?.cancel();

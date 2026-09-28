@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:http/http.dart' as http;
@@ -9,7 +7,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter/services.dart';
 import '../providers/ble_provider.dart';
-import '../providers/firmware_protocol.dart';
+import '../services/ota_firmware_image.dart';
+import '../services/ota_transfer_service.dart';
 import '../providers/settings_provider.dart';
 import '../services/update_service.dart';
 import '../l10n/app_localizations.dart';
@@ -45,8 +44,13 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
   bool _transferComplete = false;
   bool _transferError = false;
   String _errorMessage = '';
-  DateTime? _transferStartTime;
-  String _transferSpeed = '';
+
+  late BleProvider _ble;
+  bool _bound = false;
+  bool _preparingOta = false;
+  bool _usingLocal = false;
+  final _expectedVersion = TextEditingController();
+  bool get _otaBusy => _preparingOta || (_bound && _ble.otaTransfer.busy);
 
   // Downloaded firmware binary
   Uint8List? _firmwareBin;
@@ -86,12 +90,53 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_bound) {
+      _ble = Provider.of<BleProvider>(context, listen: false);
+      _ble.otaTransfer.addListener(_otaChanged);
+      _bound = true;
+    }
+  }
+
+  void _otaChanged() {
+    if (!mounted) return;
+    final transfer = _ble.otaTransfer;
+    setState(() {
+      if (_usingLocal) {
+        _localTransferring = transfer.busy;
+        _localTransferProgress = transfer.progress;
+        _localStatusMessage = transfer.status;
+        _localTransferComplete = transfer.stage == OtaStage.complete;
+        _localTransferError = transfer.stage == OtaStage.failed;
+        _localErrorMessage = transfer.status;
+      } else {
+        _transferring = transfer.busy;
+        _transferProgress = transfer.progress;
+        _statusMessage = transfer.status;
+        _transferComplete = transfer.stage == OtaStage.complete;
+        _transferError = transfer.stage == OtaStage.failed;
+        _errorMessage = transfer.status;
+      }
+      if (transfer.stage == OtaStage.complete) {
+        _currentVersion = _ble.firmwareVersion;
+      }
+    });
+  }
+
+  @override
   void dispose() {
+    if (_bound) {
+      _ble.otaTransfer.removeListener(_otaChanged);
+      _ble.otaTransfer.requestCancel();
+    }
+    _expectedVersion.dispose();
     _pulseController.dispose();
     super.dispose();
   }
 
   void _loadCurrentVersion() {
+    if (!mounted) return;
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final version = bleProvider.firmwareVersion;
     if (version.isNotEmpty) {
@@ -102,6 +147,7 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
   // ── GitHub Release Check ────────────────────────────────────
 
   Future<void> _checkForUpdates() async {
+    if (_otaBusy || _downloading || _checkingUpdate) return;
     setState(() {
       _checkingUpdate = true;
       _updateAvailable = false;
@@ -109,12 +155,14 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       _latestChangelog = null;
       _firmwareUrl = null;
       _firmwareMd5 = null;
+      _firmwareBin = null;
+      _transferComplete = false;
       _statusMessage = '';
     });
 
     try {
-      final update =
-          await UpdateService.checkFirmwareUpdate(_currentVersion);
+      final update = await UpdateService.checkFirmwareUpdate(_currentVersion);
+      if (!mounted) return;
 
       if (update == null) {
         setState(() {
@@ -129,6 +177,7 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       if (update.md5Url != null) {
         md5Hash = await UpdateService.downloadMd5(update.md5Url!);
       }
+      if (!mounted) return;
 
       setState(() {
         _latestVersion = update.version;
@@ -148,11 +197,13 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
         _pulseController.reset();
       }
     } on UpdateServiceException catch (e) {
+      if (!mounted) return;
       setState(() {
         _checkingUpdate = false;
         _statusMessage = e.message;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _checkingUpdate = false;
         _statusMessage = 'API Error: $e';
@@ -163,7 +214,7 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
   // ── Download Firmware Binary ────────────────────────────────
 
   Future<void> _downloadFirmware() async {
-    if (_firmwareUrl == null) return;
+    if (_firmwareUrl == null || _otaBusy || _downloading) return;
 
     setState(() {
       _downloading = true;
@@ -171,18 +222,22 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
     });
 
     try {
-      final response = await http.get(Uri.parse(_firmwareUrl!));
+      final response = await http
+          .get(Uri.parse(_firmwareUrl!))
+          .timeout(const Duration(seconds: 60));
+      if (!mounted) return;
       if (response.statusCode == 200) {
-        _firmwareBin = response.bodyBytes;
+        _firmwareBin = OtaFirmwareImage.parse(response.bodyBytes).bytes;
 
         // Verify MD5 if available
         if (_firmwareMd5 != null) {
           final digest = _calculateMd5(_firmwareBin!);
-          if (digest != _firmwareMd5) {
+          if (digest != _firmwareMd5!.toLowerCase()) {
             setState(() {
               _downloading = false;
               _transferError = true;
-              _errorMessage = 'MD5 mismatch!\nExpected: $_firmwareMd5\nGot: $digest';
+              _errorMessage =
+                  'MD5 mismatch!\nExpected: $_firmwareMd5\nGot: $digest';
               _firmwareBin = null;
             });
             return;
@@ -200,8 +255,10 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
         });
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _downloading = false;
+        _firmwareBin = null;
         _statusMessage = 'Download error: $e';
       });
     }
@@ -212,259 +269,171 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
     return md5.convert(data).toString();
   }
 
-  // ── BLE OTA Transfer ───────────────────────────────────────
-
-  /// Format duration as m:ss
-  String _formatDuration(Duration d) {
-    final m = d.inMinutes;
-    final s = d.inSeconds % 60;
-    return '${m}:${s.toString().padLeft(2, '0')}';
-  }
+  // ── Reviewed, acknowledgement-driven OTA ─────────────────────
 
   Future<void> _startOtaTransfer() async {
-    if (_firmwareBin == null) return;
-
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
-    if (!bleProvider.isConnected) return;
-
-    // Keep screen on during transfer
-    WakelockPlus.enable();
-
-    setState(() {
-      _transferring = true;
-      _transferProgress = 0.0;
-      _transferComplete = false;
-      _transferError = false;
-      _transferStartTime = DateTime.now();
-      _transferSpeed = '';
-      _statusMessage = 'Starting OTA transfer...';
-    });
-
+    if (_firmwareBin == null || _latestVersion == null || _otaBusy) return;
     try {
-      // Step 1: Send OTA_BEGIN with firmware size and MD5 (with response for reliability)
-      final md5Str = _firmwareMd5 ?? '';
-      final beginCmd = FirmwareBinaryProtocol.createOtaBeginCommand(
-        _firmwareBin!.length, md5Str,
-      );
-      await bleProvider.sendBinaryCommand(beginCmd);
-      await Future.delayed(const Duration(milliseconds: 300));
-
-      // Step 2: Send firmware data in chunks using writeWithoutResponse for speed
-      const chunkSize = 480; // Fits within 512 MTU with protocol overhead
-      final totalChunks = (_firmwareBin!.length / chunkSize).ceil();
-      final totalBytes = _firmwareBin!.length;
-
-      for (int i = 0; i < totalChunks; i++) {
-        final start = i * chunkSize;
-        final end = min(start + chunkSize, totalBytes);
-        final chunk = _firmwareBin!.sublist(start, end);
-
-        final dataCmd = FirmwareBinaryProtocol.createOtaDataCommand(
-          Uint8List.fromList(chunk),
-        );
-        // Use writeWithoutResponse for much faster throughput
-        await bleProvider.sendBinaryCommand(dataCmd, withoutResponse: true);
-
-        // Update UI every 20 chunks to reduce setState overhead
-        if (i % 20 == 0 || i == totalChunks - 1) {
-          final elapsed = DateTime.now().difference(_transferStartTime!);
-          final bytesSent = end;
-          final speedKBs = elapsed.inMilliseconds > 0
-              ? (bytesSent / 1024) / (elapsed.inMilliseconds / 1000)
-              : 0.0;
-          final remaining = speedKBs > 0
-              ? Duration(seconds: ((totalBytes - bytesSent) / 1024 / speedKBs).round())
-              : Duration.zero;
-
-          setState(() {
-            _transferProgress = (i + 1) / totalChunks;
-            _transferSpeed = '${speedKBs.toStringAsFixed(1)} KB/s';
-            _statusMessage = 'Chunk ${i + 1}/$totalChunks · '
-                '$_transferSpeed · '
-                'ETA ${_formatDuration(remaining)}';
-          });
-        }
-
-        // Small delay to prevent BLE buffer overflow
-        // 6ms is ~3-4x faster than the previous 30ms
-        await Future.delayed(const Duration(milliseconds: 6));
+      final image = OtaFirmwareImage.parse(_firmwareBin!);
+      await _reviewAndInstall(image, local: false, version: _latestVersion!);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _transferError = true;
+          _errorMessage = error.toString();
+        });
       }
-
-      // Step 3: Send OTA_END (with response for reliability)
-      final endCmd = FirmwareBinaryProtocol.createOtaEndCommand();
-      await bleProvider.sendBinaryCommand(endCmd);
-
-      final totalTime = DateTime.now().difference(_transferStartTime!);
-      setState(() {
-        _transferring = false;
-        _transferComplete = true;
-        _statusMessage = 'OTA complete! '
-            '${(totalBytes / 1024).toStringAsFixed(0)} KB in '
-            '${_formatDuration(totalTime)} · '
-            'Device will reboot.';
-      });
-    } catch (e) {
-      setState(() {
-        _transferring = false;
-        _transferError = true;
-        _errorMessage = 'Transfer failed: $e';
-        _statusMessage = 'OTA transfer failed';
-      });
-
-      // Send abort to firmware
-      try {
-        final abortCmd = FirmwareBinaryProtocol.createOtaAbortCommand();
-        await bleProvider.sendBinaryCommand(abortCmd);
-      } catch (_) {}
-    } finally {
-      // Release wake lock
-      WakelockPlus.disable();
     }
   }
 
-  // ── Local Binary Flash (Debug Mode) ──────────────────────────
-
   Future<void> _pickLocalBinary() async {
+    if (_otaBusy) return;
     try {
       final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['bin'],
-        withData: true,
-      );
-
-      if (result != null && result.files.single.bytes != null) {
+          type: FileType.custom, allowedExtensions: ['bin'], withData: true);
+      if (!mounted || result == null) return;
+      final file = result.files.single;
+      final bytes = file.bytes ??
+          (file.path == null ? null : await File(file.path!).readAsBytes());
+      if (bytes == null) {
+        throw StateError('The selected firmware could not be read.');
+      }
+      final image = OtaFirmwareImage.parse(bytes);
+      if (!mounted) return;
+      setState(() {
+        _localBinPath = file.name;
+        _localBin = image.bytes;
+        _expectedVersion.clear();
+        _localStatusMessage =
+            'Validated ESP32 application: ${image.bytes.length} bytes';
+        _localTransferComplete = false;
+        _localTransferError = false;
+      });
+    } catch (error) {
+      if (mounted) {
         setState(() {
-          _localBinPath = result.files.single.name;
-          _localBin = result.files.single.bytes;
-          _localStatusMessage = 'Selected: $_localBinPath (${_localBin!.length} bytes)';
-          _localTransferComplete = false;
-          _localTransferError = false;
+          _localBin = null;
+          _localBinPath = null;
+          _localTransferError = true;
+          _localErrorMessage = error.toString();
+          _localStatusMessage = 'Firmware selection failed';
         });
       }
-    } catch (e) {
-      setState(() {
-        _localStatusMessage = 'File picker error: $e';
-      });
     }
   }
 
   Future<void> _flashLocalBinary() async {
-    if (_localBin == null) return;
-
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
-    if (!bleProvider.isConnected) return;
-
-    // Keep screen on during transfer
-    WakelockPlus.enable();
-
-    setState(() {
-      _localTransferring = true;
-      _localTransferProgress = 0.0;
-      _localTransferComplete = false;
-      _localTransferError = false;
-      _localStatusMessage = 'Starting local OTA transfer...';
-    });
-
-    final startTime = DateTime.now();
-
-    try {
-      // Calculate MD5 of local binary
-      final localMd5 = _calculateMd5(_localBin!);
-
-      // Step 1: Send OTA_BEGIN with firmware size and MD5
-      final beginCmd = FirmwareBinaryProtocol.createOtaBeginCommand(
-        _localBin!.length, localMd5,
-      );
-      await bleProvider.sendBinaryCommand(beginCmd);
-      await Future.delayed(const Duration(milliseconds: 300));
-
-      // Step 2: Send firmware data in chunks using writeWithoutResponse
-      const chunkSize = 480;
-      final totalChunks = (_localBin!.length / chunkSize).ceil();
-      final totalBytes = _localBin!.length;
-
-      for (int i = 0; i < totalChunks; i++) {
-        final start = i * chunkSize;
-        final end = min(start + chunkSize, totalBytes);
-        final chunk = _localBin!.sublist(start, end);
-
-        final dataCmd = FirmwareBinaryProtocol.createOtaDataCommand(
-          Uint8List.fromList(chunk),
-        );
-        await bleProvider.sendBinaryCommand(dataCmd, withoutResponse: true);
-
-        // Update UI every 20 chunks
-        if (i % 20 == 0 || i == totalChunks - 1) {
-          final elapsed = DateTime.now().difference(startTime);
-          final bytesSent = end;
-          final speedKBs = elapsed.inMilliseconds > 0
-              ? (bytesSent / 1024) / (elapsed.inMilliseconds / 1000)
-              : 0.0;
-          final remaining = speedKBs > 0
-              ? Duration(seconds: ((totalBytes - bytesSent) / 1024 / speedKBs).round())
-              : Duration.zero;
-
-          setState(() {
-            _localTransferProgress = (i + 1) / totalChunks;
-            _localStatusMessage = 'Chunk ${i + 1}/$totalChunks · '
-                '${speedKBs.toStringAsFixed(1)} KB/s · '
-                'ETA ${_formatDuration(remaining)}';
-          });
-        }
-
-        await Future.delayed(const Duration(milliseconds: 6));
-      }
-
-      // Step 3: Send OTA_END
-      final endCmd = FirmwareBinaryProtocol.createOtaEndCommand();
-      await bleProvider.sendBinaryCommand(endCmd);
-
-      final totalTime = DateTime.now().difference(startTime);
-      setState(() {
-        _localTransferring = false;
-        _localTransferComplete = true;
-        _localStatusMessage = 'Local OTA complete! '
-            '${(totalBytes / 1024).toStringAsFixed(0)} KB in '
-            '${_formatDuration(totalTime)}';
-      });
-    } catch (e) {
-      setState(() {
-        _localTransferring = false;
-        _localTransferError = true;
-        _localErrorMessage = 'Local transfer failed: $e';
-        _localStatusMessage = 'Local OTA transfer failed';
-      });
-
-      try {
-        final abortCmd = FirmwareBinaryProtocol.createOtaAbortCommand();
-        await bleProvider.sendBinaryCommand(abortCmd);
-      } catch (_) {}
-    } finally {
-      WakelockPlus.disable();
-    }
+    if (_localBin == null || _otaBusy) return;
+    await _reviewAndInstall(OtaFirmwareImage.parse(_localBin!), local: true);
   }
 
-  Future<void> _rebootDevice() async {
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
-    if (!bleProvider.isConnected) return;
-
-    // Notify BLE provider to auto-reconnect after reboot
-    bleProvider.notifyOtaReboot();
-    
-    final cmd = FirmwareBinaryProtocol.createOtaRebootCommand();
-    await bleProvider.sendBinaryCommand(cmd);
-
-    if (!mounted) return;
-
-    // Show reboot dialog with animated timer
-    final goHome = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => const _RebootDialog(),
-    );
-
-    if (goHome == true && mounted) {
-      Navigator.of(context).popUntil((route) => route.isFirst);
+  Future<void> _reviewAndInstall(OtaFirmwareImage image,
+      {required bool local, String? version}) async {
+    if (_otaBusy || !_ble.isConnected) return;
+    setState(() => _preparingOta = true);
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) =>
+            StatefulBuilder(builder: (context, updateDialog) {
+          final expected = local ? _expectedVersion.text.trim() : version!;
+          return AlertDialog(
+            title: const Text('Review Bluetooth firmware update'),
+            content: SizedBox(
+                width: 540,
+                child: SingleChildScrollView(
+                    child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                        '${image.bytes.length} bytes · inactive OTA application partition'),
+                    const SizedBox(height: 12),
+                    const Text('SHA-256'),
+                    SelectableText(image.sha256),
+                    const SizedBox(height: 12),
+                    const Text('MD5 checked by the device'),
+                    SelectableText(image.md5),
+                    const SizedBox(height: 12),
+                    if (local)
+                      TextField(
+                        controller: _expectedVersion,
+                        onChanged: (_) => updateDialog(() {}),
+                        decoration: const InputDecoration(
+                            labelText:
+                                'Expected firmware version after restart',
+                            hintText: 'For example: 1.1.4'),
+                      )
+                    else
+                      Text(
+                          'Expected firmware version after restart: $expected'),
+                    const SizedBox(height: 12),
+                    const Text(
+                        'The app verifies the image, transfers it, waits for device validation, '
+                        'restarts the board, and checks its reported version. Keep the device powered. '
+                        'Cancellation is available until final verification starts.'),
+                  ],
+                ))),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Cancel')),
+              FilledButton(
+                  onPressed: expected.isEmpty
+                      ? null
+                      : () => Navigator.pop(dialogContext, true),
+                  child: const Text('Install and verify')),
+            ],
+          );
+        }),
+      );
+      if (confirmed != true || !mounted) return;
+      _usingLocal = local;
+      setState(() {
+        if (local) {
+          _localTransferComplete = false;
+          _localTransferError = false;
+          _localTransferring = true;
+          _localStatusMessage = 'Checking radio state...';
+        } else {
+          _transferComplete = false;
+          _transferError = false;
+          _transferring = true;
+          _statusMessage = 'Checking radio state...';
+        }
+      });
+      await WakelockPlus.enable();
+      await _ble.installOtaFirmware(image,
+          expectedVersion: local ? _expectedVersion.text.trim() : version!);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          final message = _ble.otaTransfer.stage == OtaStage.failed ||
+                  _ble.otaTransfer.stage == OtaStage.cancelled
+              ? _ble.otaTransfer.status
+              : error.toString();
+          if (local) {
+            _localTransferError = error is! OtaCancelled;
+            _localErrorMessage = message;
+            _localStatusMessage = message;
+          } else {
+            _transferError = error is! OtaCancelled;
+            _errorMessage = message;
+            _statusMessage = message;
+          }
+        });
+      }
+    } finally {
+      try {
+        await WakelockPlus.disable();
+      } catch (_) {}
+      if (mounted) {
+        setState(() {
+          _preparingOta = false;
+          _localTransferring = false;
+          _transferring = false;
+        });
+      }
     }
   }
 
@@ -478,46 +447,59 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
     return Consumer<BleProvider>(
       builder: (context, bleProvider, _) {
         // Keep current version in sync with BLE provider
-        if (bleProvider.firmwareVersion.isNotEmpty && _currentVersion == 'Unknown') {
+        if (bleProvider.firmwareVersion.isNotEmpty &&
+            _currentVersion == 'Unknown') {
           _currentVersion = bleProvider.firmwareVersion;
         }
-        return Scaffold(
-          backgroundColor: AppColors.primaryBackground,
-          appBar: AppBar(
-            title: Text(AppLocalizations.of(context)!.otaUpdate),
-            backgroundColor: AppColors.secondaryBackground,
-            foregroundColor: AppColors.primaryText,
-            elevation: 0,
-          ),
-          body: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildVersionCard(bleProvider),
-                const SizedBox(height: 16),
-                _buildUpdateCheckCard(),
-                if (_updateAvailable && _latestChangelog != null) ...[
-                  const SizedBox(height: 16),
-                  _buildChangelogCard(),
-                ],
-                if (_firmwareBin != null || _transferring || _transferComplete) ...[
-                  const SizedBox(height: 16),
-                  _buildTransferCard(),
-                ],
-                if (_transferError) ...[
-                  const SizedBox(height: 16),
-                  _buildErrorCard(),
-                ],
-                // Local binary flash — only visible in debug mode
-                if (isDebugMode) ...[
-                  const SizedBox(height: 24),
-                  _buildLocalFlashCard(bleProvider),
-                ],
-              ],
-            ),
-          ),
-        );
+        return PopScope(
+            canPop: !_otaBusy,
+            onPopInvokedWithResult: (didPop, result) {
+              if (!didPop && mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text(
+                        'Wait for OTA to finish, or cancel before verification.')));
+              }
+            },
+            child: Scaffold(
+              backgroundColor: AppColors.primaryBackground,
+              appBar: AppBar(
+                title: Text(AppLocalizations.of(context)!.otaUpdate),
+                backgroundColor: AppColors.secondaryBackground,
+                foregroundColor: AppColors.primaryText,
+                elevation: 0,
+                automaticallyImplyLeading: !_otaBusy,
+              ),
+              body: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildVersionCard(bleProvider),
+                    const SizedBox(height: 16),
+                    _buildUpdateCheckCard(),
+                    if (_updateAvailable && _latestChangelog != null) ...[
+                      const SizedBox(height: 16),
+                      _buildChangelogCard(),
+                    ],
+                    if (_firmwareBin != null ||
+                        _transferring ||
+                        _transferComplete) ...[
+                      const SizedBox(height: 16),
+                      _buildTransferCard(),
+                    ],
+                    if (_transferError) ...[
+                      const SizedBox(height: 16),
+                      _buildErrorCard(),
+                    ],
+                    // Local application images are available in normal macOS use.
+                    if (Platform.isMacOS || isDebugMode) ...[
+                      const SizedBox(height: 24),
+                      _buildLocalFlashCard(bleProvider),
+                    ],
+                  ],
+                ),
+              ),
+            ));
       },
     );
   }
@@ -529,10 +511,15 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildInfoRow(AppLocalizations.of(context)!.currentFirmware, _currentVersion),
+          _buildInfoRow(
+              AppLocalizations.of(context)!.currentFirmware, _currentVersion),
           if (bleProvider.freeHeap != null)
             _buildInfoRow('Free Heap', '${bleProvider.freeHeap} bytes'),
-          _buildInfoRow(AppLocalizations.of(context)!.connection, bleProvider.isConnected ? AppLocalizations.of(context)!.connectedStatus : AppLocalizations.of(context)!.disconnectedStatus),
+          _buildInfoRow(
+              AppLocalizations.of(context)!.connection,
+              bleProvider.isConnected
+                  ? AppLocalizations.of(context)!.connectedStatus
+                  : AppLocalizations.of(context)!.disconnectedStatus),
         ],
       ),
     );
@@ -545,14 +532,17 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       child: Column(
         children: [
           if (_latestVersion != null) ...[
-            _buildInfoRow(AppLocalizations.of(context)!.latestVersion, _latestVersion!),
+            _buildInfoRow(
+                AppLocalizations.of(context)!.latestVersion, _latestVersion!),
             _updateAvailable
                 ? _buildUpdateAvailableRow()
-                : _buildInfoRow(AppLocalizations.of(context)!.updateAvailable, AppLocalizations.of(context)!.upToDate),
+                : _buildInfoRow(AppLocalizations.of(context)!.updateAvailable,
+                    AppLocalizations.of(context)!.upToDate),
             if (_firmwareMd5 != null)
               GestureDetector(
                 onTap: () => _showMd5Dialog(),
-                child: _buildInfoRow('MD5', '${_firmwareMd5!.substring(0, min(16, _firmwareMd5!.length))}…'),
+                child: _buildInfoRow('MD5',
+                    '${_firmwareMd5!.substring(0, min(16, _firmwareMd5!.length))}…'),
               ),
             const SizedBox(height: 12),
           ],
@@ -560,21 +550,27 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _checkingUpdate ? null : _checkForUpdates,
+                  onPressed:
+                      (_checkingUpdate || _otaBusy) ? null : _checkForUpdates,
                   icon: _checkingUpdate
                       ? const SizedBox(
-                          width: 16, height: 16,
+                          width: 16,
+                          height: 16,
                           child: CircularProgressIndicator(
                               strokeWidth: 2, color: AppColors.primaryAccent))
                       : const Icon(Icons.refresh),
-                  label: Text(_checkingUpdate ? AppLocalizations.of(context)!.checking : AppLocalizations.of(context)!.checkForUpdates),
+                  label: Text(_checkingUpdate
+                      ? AppLocalizations.of(context)!.checking
+                      : AppLocalizations.of(context)!.checkForUpdates),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: AppColors.primaryAccent,
                     foregroundColor: AppColors.primaryBackground,
                   ),
                 ),
               ),
-              if (_updateAvailable && _firmwareBin == null && !_downloading) ...[
+              if (_updateAvailable &&
+                  _firmwareBin == null &&
+                  !_downloading) ...[
                 const SizedBox(width: 8),
                 Expanded(
                   child: AnimatedBuilder(
@@ -585,7 +581,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                           borderRadius: BorderRadius.circular(20),
                           boxShadow: [
                             BoxShadow(
-                              color: AppColors.warning.withValues(alpha: 0.3 + 0.35 * _pulseAnimation.value),
+                              color: AppColors.warning.withValues(
+                                  alpha: 0.3 + 0.35 * _pulseAnimation.value),
                               blurRadius: 6 + 8 * _pulseAnimation.value,
                               spreadRadius: 1 + 2 * _pulseAnimation.value,
                             ),
@@ -595,7 +592,7 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                       );
                     },
                     child: ElevatedButton.icon(
-                      onPressed: _downloadFirmware,
+                      onPressed: _otaBusy ? null : _downloadFirmware,
                       icon: const Icon(Icons.download),
                       label: Text(AppLocalizations.of(context)!.download),
                       style: ElevatedButton.styleFrom(
@@ -620,7 +617,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Text(_statusMessage,
-                  style: TextStyle(color: AppColors.secondaryText, fontSize: 12)),
+                  style:
+                      TextStyle(color: AppColors.secondaryText, fontSize: 12)),
             ),
         ],
       ),
@@ -629,7 +627,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
 
   Widget _buildChangelogCard() {
     return _buildCard(
-      title: AppLocalizations.of(context)!.changelogVersion(_latestVersion ?? ''),
+      title:
+          AppLocalizations.of(context)!.changelogVersion(_latestVersion ?? ''),
       icon: Icons.description,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxHeight: 200),
@@ -647,9 +646,11 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
-                            color: _getChangeTypeColor(type).withValues(alpha: 0.15),
+                            color: _getChangeTypeColor(type)
+                                .withValues(alpha: 0.15),
                             borderRadius: BorderRadius.circular(4),
                           ),
                           child: Text(
@@ -665,7 +666,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                         Expanded(
                           child: Text(
                             text,
-                            style: TextStyle(color: AppColors.primaryText, fontSize: 13),
+                            style: TextStyle(
+                                color: AppColors.primaryText, fontSize: 13),
                           ),
                         ),
                       ],
@@ -675,7 +677,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
               else
                 Text(
                   _latestChangelog ?? '',
-                  style: TextStyle(color: AppColors.primaryText, fontSize: 13, height: 1.5),
+                  style: TextStyle(
+                      color: AppColors.primaryText, fontSize: 13, height: 1.5),
                 ),
             ],
           ),
@@ -691,6 +694,11 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       child: Column(
         children: [
           if (_transferring) ...[
+            if (_ble.otaTransfer.canCancel)
+              TextButton.icon(
+                  onPressed: _ble.otaTransfer.requestCancel,
+                  icon: const Icon(Icons.cancel_outlined),
+                  label: const Text('Cancel transfer')),
             Text(_statusMessage,
                 style: TextStyle(color: AppColors.primaryText, fontSize: 13)),
             const SizedBox(height: 12),
@@ -712,11 +720,12 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
           ],
           if (_transferComplete) ...[
             const Center(
-              child: Icon(Icons.check_circle, color: AppColors.success, size: 48),
+              child:
+                  Icon(Icons.check_circle, color: AppColors.success, size: 48),
             ),
             const SizedBox(height: 12),
             Center(
-              child: Text(AppLocalizations.of(context)!.firmwareUploadedSuccess,
+              child: Text('Firmware and restart verified',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                       color: AppColors.success,
@@ -725,29 +734,22 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
             ),
             const SizedBox(height: 8),
             Center(
-              child: Text(AppLocalizations.of(context)!.deviceWillVerify,
+              child: Text(_statusMessage,
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: AppColors.secondaryText, fontSize: 13)),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton.icon(
-              onPressed: _rebootDevice,
-              icon: const Icon(Icons.restart_alt),
-              label: Text(AppLocalizations.of(context)!.rebootDevice),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.warning,
-                foregroundColor: AppColors.primaryBackground,
-              ),
+                  style:
+                      TextStyle(color: AppColors.secondaryText, fontSize: 13)),
             ),
           ],
           if (!_transferring && !_transferComplete && _firmwareBin != null) ...[
-            Text(AppLocalizations.of(context)!.firmwareReady(_firmwareBin!.length),
+            Text(
+                AppLocalizations.of(context)!
+                    .firmwareReady(_firmwareBin!.length),
                 style: TextStyle(color: AppColors.primaryText, fontSize: 13)),
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: _startOtaTransfer,
+                onPressed: _otaBusy ? null : _startOtaTransfer,
                 icon: const Icon(Icons.upload),
                 label: Text(AppLocalizations.of(context)!.startOtaUpdate),
                 style: ElevatedButton.styleFrom(
@@ -820,12 +822,13 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                         fontSize: 14)),
                 const Spacer(),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
                     color: AppColors.warning.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(4),
                   ),
-                  child: Text('DEBUG',
+                  child: Text(Platform.isMacOS ? 'BLE OTA' : 'DEBUG',
                       style: TextStyle(
                           color: AppColors.warning,
                           fontSize: 10,
@@ -842,14 +845,15 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
               children: [
                 Text(
                   AppLocalizations.of(context)!.selectBinFileDesc,
-                  style: TextStyle(color: AppColors.secondaryText, fontSize: 12),
+                  style:
+                      TextStyle(color: AppColors.secondaryText, fontSize: 12),
                 ),
                 const SizedBox(height: 12),
                 Row(
                   children: [
                     Expanded(
                       child: ElevatedButton.icon(
-                        onPressed: (_localTransferring) ? null : _pickLocalBinary,
+                        onPressed: _otaBusy ? null : _pickLocalBinary,
                         icon: const Icon(Icons.folder_open),
                         label: Text(AppLocalizations.of(context)!.selectBin),
                         style: ElevatedButton.styleFrom(
@@ -858,11 +862,15 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                         ),
                       ),
                     ),
-                    if (_localBin != null && !_localTransferring && !_localTransferComplete) ...[
+                    if (_localBin != null &&
+                        !_localTransferring &&
+                        !_localTransferComplete) ...[
                       const SizedBox(width: 8),
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: bleProvider.isConnected ? _flashLocalBinary : null,
+                          onPressed: bleProvider.isConnected && !_otaBusy
+                              ? _flashLocalBinary
+                              : null,
                           icon: const Icon(Icons.flash_on),
                           label: Text(AppLocalizations.of(context)!.flash),
                           style: ElevatedButton.styleFrom(
@@ -874,16 +882,25 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                     ],
                   ],
                 ),
-                if (_localBinPath != null && !_localTransferring && !_localTransferComplete)
+                if (_localBinPath != null &&
+                    !_localTransferring &&
+                    !_localTransferComplete)
                   Padding(
                     padding: const EdgeInsets.only(top: 8),
                     child: Text('File: $_localBinPath',
-                        style: TextStyle(color: AppColors.primaryText, fontSize: 12)),
+                        style: TextStyle(
+                            color: AppColors.primaryText, fontSize: 12)),
                   ),
                 if (_localTransferring) ...[
+                  if (_ble.otaTransfer.canCancel)
+                    TextButton.icon(
+                        onPressed: _ble.otaTransfer.requestCancel,
+                        icon: const Icon(Icons.cancel_outlined),
+                        label: const Text('Cancel transfer')),
                   const SizedBox(height: 12),
                   Text(_localStatusMessage,
-                      style: TextStyle(color: AppColors.primaryText, fontSize: 13)),
+                      style: TextStyle(
+                          color: AppColors.primaryText, fontSize: 13)),
                   const SizedBox(height: 8),
                   ClipRRect(
                     borderRadius: BorderRadius.circular(6),
@@ -905,32 +922,25 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                   const SizedBox(height: 12),
                   Icon(Icons.check_circle, color: AppColors.success, size: 40),
                   const SizedBox(height: 8),
-                  Text(AppLocalizations.of(context)!.localFirmwareUploaded,
+                  Text(_localStatusMessage,
                       style: TextStyle(
                           color: AppColors.success,
                           fontWeight: FontWeight.bold,
                           fontSize: 14)),
-                  const SizedBox(height: 8),
-                  ElevatedButton.icon(
-                    onPressed: _rebootDevice,
-                    icon: const Icon(Icons.restart_alt),
-                    label: Text(AppLocalizations.of(context)!.rebootDevice),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.warning,
-                      foregroundColor: AppColors.primaryBackground,
-                    ),
-                  ),
                 ],
                 if (_localTransferError) ...[
                   const SizedBox(height: 8),
                   Text(_localErrorMessage,
                       style: TextStyle(color: AppColors.error, fontSize: 12)),
                 ],
-                if (_localStatusMessage.isNotEmpty && !_localTransferring && !_localTransferComplete)
+                if (_localStatusMessage.isNotEmpty &&
+                    !_localTransferring &&
+                    !_localTransferComplete)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
                     child: Text(_localStatusMessage,
-                        style: TextStyle(color: AppColors.secondaryText, fontSize: 12)),
+                        style: TextStyle(
+                            color: AppColors.secondaryText, fontSize: 12)),
                   ),
               ],
             ),
@@ -1008,7 +1018,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
             animation: _pulseAnimation,
             builder: (context, child) {
               return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                 decoration: BoxDecoration(
                   color: AppColors.primaryAccent
                       .withValues(alpha: 0.1 + 0.12 * _pulseAnimation.value),
@@ -1052,7 +1063,8 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
         ),
         title: Row(
           children: [
-            const Icon(Icons.fingerprint, color: AppColors.primaryAccent, size: 20),
+            const Icon(Icons.fingerprint,
+                color: AppColors.primaryAccent, size: 20),
             const SizedBox(width: 8),
             const Text('MD5 Checksum',
                 style: TextStyle(color: AppColors.primaryAccent, fontSize: 16)),
@@ -1099,11 +1111,13 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
                 ),
               );
             },
-            child: const Text('Copy', style: TextStyle(color: AppColors.primaryAccent)),
+            child: const Text('Copy',
+                style: TextStyle(color: AppColors.primaryAccent)),
           ),
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Close', style: TextStyle(color: AppColors.secondaryText)),
+            child: const Text('Close',
+                style: TextStyle(color: AppColors.secondaryText)),
           ),
         ],
       ),
@@ -1127,118 +1141,5 @@ class _OtaScreenState extends State<OtaScreen> with TickerProviderStateMixin {
       default:
         return AppColors.secondaryText;
     }
-  }
-}
-
-// ── Reboot dialog with animated timer and version check ───────────
-
-class _RebootDialog extends StatefulWidget {
-  const _RebootDialog();
-
-  @override
-  State<_RebootDialog> createState() => _RebootDialogState();
-}
-
-class _RebootDialogState extends State<_RebootDialog>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _spinController;
-  int _elapsed = 0;
-  Timer? _timer;
-
-  @override
-  void initState() {
-    super.initState();
-    _spinController = AnimationController(
-      duration: const Duration(seconds: 2),
-      vsync: this,
-    )..repeat();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() => _elapsed++);
-    });
-  }
-
-  @override
-  void dispose() {
-    _spinController.dispose();
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer<BleProvider>(
-      builder: (context, bleProvider, _) {
-        // Consider reconnected after at least 3 seconds and firmware version is available
-        final isReconnected = bleProvider.isConnected &&
-            bleProvider.firmwareVersion.isNotEmpty &&
-            _elapsed > 3;
-
-        return AlertDialog(
-          backgroundColor: AppColors.secondaryBackground,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: AppColors.borderDefault),
-          ),
-          title: Text(
-            isReconnected ? 'Update Complete!' : 'Rebooting Device...',
-            style: const TextStyle(color: AppColors.primaryAccent, fontSize: 18),
-            textAlign: TextAlign.center,
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (!isReconnected) ...[
-                RotationTransition(
-                  turns: _spinController,
-                  child: const Icon(Icons.refresh,
-                      size: 48, color: AppColors.primaryAccent),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Reboot in progress...\n${_elapsed}s',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      color: AppColors.primaryText, fontSize: 14),
-                ),
-                const SizedBox(height: 12),
-                LinearProgressIndicator(
-                  color: AppColors.primaryAccent,
-                  backgroundColor:
-                      AppColors.primaryAccent.withValues(alpha: 0.2),
-                ),
-              ] else ...[
-                const Icon(Icons.check_circle,
-                    size: 56, color: AppColors.success),
-                const SizedBox(height: 16),
-                Text(
-                  'Firmware updated to\nv${bleProvider.firmwareVersion}',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: AppColors.success,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                  ),
-                ),
-              ],
-            ],
-          ),
-          actions: [
-            if (isReconnected)
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.of(context).pop(true),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.primaryAccent,
-                    foregroundColor: AppColors.primaryBackground,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                  child: const Text('OK', style: TextStyle(fontSize: 16)),
-                ),
-              ),
-          ],
-        );
-      },
-    );
   }
 }
