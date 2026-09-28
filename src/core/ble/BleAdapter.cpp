@@ -508,7 +508,7 @@ void BleAdapter::sendSingleChunk(uint8_t chunkId, uint8_t chunkNum, uint8_t tota
     
     // Log first chunk to debug missing chunk issue
     if (chunkNum == 1) {
-        ESP_LOGI(TAG, "Sending FIRST chunk: chunkId=%d, chunkNum=%d/%d, dataLen=%d, packetSize=%d", 
+        ESP_LOGD(TAG, "Sending FIRST chunk: chunkId=%d, chunkNum=%d/%d, dataLen=%d, packetSize=%d",
                  chunkId, chunkNum, totalChunks, dataLen, packetSize);
     }
     
@@ -528,7 +528,7 @@ void BleAdapter::sendSingleChunk(uint8_t chunkId, uint8_t chunkNum, uint8_t tota
     
     // Log first chunk data preview for debugging
     if (chunkNum == 1 && dataLen > 0) {
-        ESP_LOGI(TAG, "First chunk first byte: 0x%02X, magic: 0x%02X", 
+        ESP_LOGD(TAG, "First chunk first byte: 0x%02X, magic: 0x%02X",
                  chunkData[0], packet[0]);
     }
     
@@ -536,7 +536,7 @@ void BleAdapter::sendSingleChunk(uint8_t chunkId, uint8_t chunkNum, uint8_t tota
     pTxCharacteristic->notify();
     
     if (chunkNum == 1) {
-        ESP_LOGI(TAG, "First chunk notify() called, packetSize=%d", packetSize);
+        ESP_LOGD(TAG, "First chunk notify() called, packetSize=%d", packetSize);
     }
     
     // Release mutex before delay

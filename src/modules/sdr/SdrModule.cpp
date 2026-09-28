@@ -18,9 +18,35 @@
 
 #include "modules/CC1101_driver/CC1101_Worker.h"
 #include "CC1101_Radio.h"
+#include "esp32-hal-uart.h"
 #include <cstring>
 
 static const char* TAG = "SDR";
+
+namespace {
+// The shared receiver uses asynchronous GPIO data. Save only the registers
+// overridden for FIFO streaming so stopping SDR restores that receiver setup.
+constexpr uint8_t rawRxRegisters[] = {
+    CC1101_PKTCTRL0, CC1101_PKTCTRL1, CC1101_MDMCFG1,
+    CC1101_MDMCFG2, CC1101_MCSM2
+};
+uint8_t savedRawRxRegisters[sizeof(rawRxRegisters)] = {};
+bool rawRxRegistersSaved = false;
+bool rawRxMutedUart0Debug = false;
+SemaphoreHandle_t rawRxOutputMutex = nullptr;
+
+// Polling runs on the Arduino task, while stop can arrive on a BLE/USB task.
+// Serialize the complete output operation so no payload follows the stop ACK.
+class RawRxOutputGuard {
+public:
+    explicit RawRxOutputGuard(TickType_t timeout)
+        : locked_(rawRxOutputMutex && xSemaphoreTakeRecursive(rawRxOutputMutex, timeout) == pdTRUE) {}
+    ~RawRxOutputGuard() { if (locked_) xSemaphoreGiveRecursive(rawRxOutputMutex); }
+    explicit operator bool() const { return locked_; }
+private:
+    bool locked_;
+};
+}
 
 // ── Static member initialization ────────────────────────────────────
 
@@ -40,6 +66,11 @@ SdrSubMode SdrModule::subMode_         = SdrSubMode::Idle;
 
 void SdrModule::init() {
     if (initialized_) return;
+    rawRxOutputMutex = xSemaphoreCreateRecursiveMutex();
+    if (!rawRxOutputMutex) {
+        ESP_LOGE(TAG, "Cannot allocate RX output mutex");
+        return;
+    }
     ESP_LOGI(TAG, "SDR module initialized (inactive, module=%d)", SDR_DEFAULT_MODULE);
     initialized_ = true;
 }
@@ -47,6 +78,8 @@ void SdrModule::init() {
 // ── SDR mode lifecycle ──────────────────────────────────────────────
 
 bool SdrModule::enable(int module) {
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
     if (active_) {
         ESP_LOGW(TAG, "SDR mode already active");
         return true;
@@ -73,12 +106,9 @@ bool SdrModule::enable(int module) {
     streamSeqNum_ = 0;
     totalBytesStreamed_ = 0;
 
-    // Put the CC1101 module in idle mode
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    // ModuleCc1101 methods acquire the non-recursive SPI mutex themselves.
+    // Taking it here too deadlocks the serial/BLE command task.
+    moduleCC1101State[sdrModule_].setSidle();
 
     ESP_LOGI(TAG, "SDR mode ENABLED on module %d", sdrModule_);
     sendStatus();
@@ -86,6 +116,8 @@ bool SdrModule::enable(int module) {
 }
 
 bool SdrModule::disable() {
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
     if (!active_) {
         ESP_LOGW(TAG, "SDR mode already inactive");
         return true;
@@ -97,11 +129,7 @@ bool SdrModule::disable() {
     }
 
     // Put module back in idle
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    moduleCC1101State[sdrModule_].setSidle();
 
     active_ = false;
     subMode_ = SdrSubMode::Idle;
@@ -132,79 +160,66 @@ bool SdrModule::isValidFrequency(float freqMHz) {
 }
 
 bool SdrModule::setFrequency(float freqMHz) {
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
     if (!active_) {
         ESP_LOGW(TAG, "Cannot set frequency: SDR mode not active");
         return false;
     }
+
+    if (streaming_) return false;  // Stop RX before changing its configuration.
 
     if (!isValidFrequency(freqMHz)) {
         ESP_LOGW(TAG, "Frequency %.2f MHz out of CC1101 range", freqMHz);
         return false;
     }
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].changeFrequency(freqMHz);
-        currentFreqMHz_ = freqMHz;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Frequency set to %.3f MHz", freqMHz);
-        return true;
-    }
-
-    ESP_LOGE(TAG, "Failed to acquire SPI mutex for setFrequency");
-    return false;
+    moduleCC1101State[sdrModule_].changeFrequency(freqMHz);
+    currentFreqMHz_ = freqMHz;
+    ESP_LOGI(TAG, "Frequency set to %.3f MHz", freqMHz);
+    return true;
 }
 
 bool SdrModule::setModulation(int mod) {
-    if (!active_) return false;
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
+    if (!active_ || streaming_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        // Apply modulation via full config (keeps other settings)
-        moduleCC1101State[sdrModule_].setConfig(
-            MODE_RECEIVE, currentFreqMHz_, true, mod,
-            currentBandwidthKHz_, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentModulation_ = mod;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Modulation set to %d", mod);
-        return true;
-    }
-    return false;
+    moduleCC1101State[sdrModule_].setConfig(
+        MODE_RECEIVE, currentFreqMHz_, true, mod,
+        currentBandwidthKHz_, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentModulation_ = mod;
+    ESP_LOGI(TAG, "Modulation set to %d", mod);
+    return true;
 }
 
 bool SdrModule::setBandwidth(float bwKHz) {
-    if (!active_) return false;
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
+    if (!active_ || streaming_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            bwKHz, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentBandwidthKHz_ = bwKHz;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Bandwidth set to %.1f kHz", bwKHz);
-        return true;
-    }
-    return false;
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        bwKHz, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentBandwidthKHz_ = bwKHz;
+    ESP_LOGI(TAG, "Bandwidth set to %.1f kHz", bwKHz);
+    return true;
 }
 
 bool SdrModule::setDataRate(float rate) {
-    if (!active_) return false;
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
+    if (!active_ || streaming_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            currentBandwidthKHz_, 1.58f, rate);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentDataRate_ = rate;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Data rate set to %.2f kBaud", rate);
-        return true;
-    }
-    return false;
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        currentBandwidthKHz_, 1.58f, rate);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentDataRate_ = rate;
+    ESP_LOGI(TAG, "Data rate set to %.2f kBaud", rate);
+    return true;
 }
 
 // ── RSSI reading ────────────────────────────────────────────────────
@@ -218,10 +233,14 @@ int SdrModule::readRssi() {
 // ── Spectrum scan ───────────────────────────────────────────────────
 
 int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return 0;
     if (!active_) {
         ESP_LOGW(TAG, "Cannot scan: SDR mode not active");
         return 0;
     }
+
+    if (streaming_) return 0;  // A sweep would interrupt the FIFO receiver.
 
     subMode_ = SdrSubMode::SpectrumScan;
 
@@ -260,10 +279,10 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
         if (!isValidFrequency(freq)) {
             rssiBuffer[bufferIdx++] = -128;  // Mark as invalid
         } else {
+            // The wrapper locks internally; only direct driver calls below
+            // need an explicit SPI lock.
+            moduleCC1101State[sdrModule_].changeFrequency(freq);
             if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
-                // Set frequency
-                moduleCC1101State[sdrModule_].changeFrequency(freq);
-
                 // Enter RX mode for RSSI measurement
                 cc1101.setModul(sdrModule_);
                 cc1101.SetRx(freq);
@@ -274,13 +293,8 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
                 delayMicroseconds(SDR_RSSI_SETTLE_US);
 
                 // Read RSSI (thread-safe via SPI semaphore inside getRssi)
-                if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
-                    int rssi = moduleCC1101State[sdrModule_].getRssi();
-                    rssiBuffer[bufferIdx++] = (int8_t)constrain(rssi, -128, 0);
-                    xSemaphoreGive(spiMutex);
-                } else {
-                    rssiBuffer[bufferIdx++] = -128;
-                }
+                int rssi = moduleCC1101State[sdrModule_].getRssi();
+                rssiBuffer[bufferIdx++] = (int8_t)constrain(rssi, -128, 0);
             } else {
                 rssiBuffer[bufferIdx++] = -128;
             }
@@ -307,10 +321,7 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
     }
 
     // Return to idle after scan
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    moduleCC1101State[sdrModule_].setSidle();
 
     subMode_ = SdrSubMode::Idle;
     ESP_LOGI(TAG, "Spectrum scan complete: %d points", pointsScanned);
@@ -320,6 +331,9 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
 // ── Raw RX streaming ────────────────────────────────────────────────
 
 bool SdrModule::startRawRx() {
+    if (!initialized_) return false;
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard) return false;
     if (!active_) {
         ESP_LOGW(TAG, "Cannot start RX: SDR mode not active");
         return false;
@@ -330,16 +344,31 @@ bool SdrModule::startRawRx() {
         return true;
     }
 
+    if (subMode_ != SdrSubMode::Idle) return false;
+
+    // Configure through the wrapper before taking the lock for direct SPI.
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        currentBandwidthKHz_, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+
     SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
     if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        // Configure CC1101 for RX at current frequency
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            currentBandwidthKHz_, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-
-        // Enter RX mode
         cc1101.setModul(sdrModule_);
+        cc1101.setSidle();
+        for (size_t i = 0; i < sizeof(rawRxRegisters); ++i) {
+            savedRawRxRegisters[i] = cc1101.SpiReadReg(rawRxRegisters[i]);
+        }
+        rawRxRegistersSaved = true;
+
+        // CC1101 datasheet sections 15.2 and 27.1: asynchronous mode bypasses
+        // the FIFO. Use normal FIFO mode with infinite length for this stream.
+        cc1101.SpiWriteReg(CC1101_PKTCTRL0, 0x02); // FIFO, no whitening/CRC.
+        cc1101.SpiWriteReg(CC1101_PKTCTRL1, 0x00); // No address/CRC filtering/status.
+        cc1101.SpiWriteReg(CC1101_MDMCFG1, savedRawRxRegisters[2] & ~0x80); // No FEC.
+        cc1101.SpiWriteReg(CC1101_MDMCFG2, savedRawRxRegisters[3] & ~0x08); // No Manchester.
+        cc1101.SpiWriteReg(CC1101_MCSM2, 0x07); // Stay in RX without timeout/carrier termination.
+        cc1101.SpiStrobe(CC1101_SFRX);
         cc1101.SetRx(currentFreqMHz_);
 
         xSemaphoreGive(spiMutex);
@@ -347,6 +376,12 @@ bool SdrModule::startRawRx() {
         ESP_LOGE(TAG, "Failed to acquire SPI mutex for startRawRx");
         return false;
     }
+
+    // Arduino's ESP_LOG macros write to the UART debug channel directly.
+    // Silence that channel during binary RX; explicit Serial writes still work.
+    // Leave an already disabled or differently routed debug channel untouched.
+    rawRxMutedUart0Debug = uartGetDebug() == 0;
+    if (rawRxMutedUart0Debug) Serial.setDebugOutput(false);
 
     streaming_ = true;
     streamSeqNum_ = 0;
@@ -359,16 +394,27 @@ bool SdrModule::startRawRx() {
 }
 
 void SdrModule::stopRawRx() {
-    if (!streaming_) return;
-
+    RawRxOutputGuard outputGuard(portMAX_DELAY);
+    if (!outputGuard || !streaming_) return;
+    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
+    xSemaphoreTake(spiMutex, portMAX_DELAY);
     streaming_ = false;
     subMode_ = SdrSubMode::Idle;
 
-    // Put CC1101 back to idle
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
+    cc1101.setModul(sdrModule_);
+    cc1101.setSidle();
+    cc1101.SpiStrobe(CC1101_SFRX);
+    if (rawRxRegistersSaved) {
+        for (size_t i = 0; i < sizeof(rawRxRegisters); ++i) {
+            cc1101.SpiWriteReg(rawRxRegisters[i], savedRawRxRegisters[i]);
+        }
+        rawRxRegistersSaved = false;
+    }
+    xSemaphoreGive(spiMutex);
+
+    if (rawRxMutedUart0Debug) {
+        Serial.setDebugOutput(true);
+        rawRxMutedUart0Debug = false;
     }
 
     ESP_LOGI(TAG, "Raw RX stopped. Total bytes streamed: %u", totalBytesStreamed_);
@@ -377,19 +423,54 @@ void SdrModule::stopRawRx() {
 void SdrModule::pollRawRx() {
     if (!streaming_) return;
 
+    RawRxOutputGuard outputGuard(0);
+    if (!outputGuard || !streaming_) return;
     SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
     if (!xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10))) {
         return;  // Don't block if SPI is busy
     }
 
-    // Check how many bytes are in the RX FIFO
-    cc1101.setModul(sdrModule_);
-    byte rxBytes = cc1101.SpiReadStatus(CC1101_RXBYTES) & 0x7F;
+    // Stop may have completed while this task waited for the SPI lock.
+    if (!streaming_) {
+        xSemaphoreGive(spiMutex);
+        return;
+    }
 
-    if (rxBytes > 0) {
-        // Read up to 64 bytes from FIFO (CC1101 FIFO is 64 bytes)
+    cc1101.setModul(sdrModule_);
+    // Section 20 of the CC1101 datasheet requires matching consecutive reads
+    // of RXBYTES while receiving. Bound retries so a fast stream cannot spin.
+    byte rxStatus = cc1101.SpiReadStatus(CC1101_RXBYTES);
+    bool stable = false;
+    for (int retry = 0; retry < 8; ++retry) {
+        byte nextStatus = cc1101.SpiReadStatus(CC1101_RXBYTES);
+        if (nextStatus == rxStatus) {
+            stable = true;
+            break;
+        }
+        rxStatus = nextStatus;
+    }
+
+    // Keep the overflow flag before masking the byte count. Recover under the
+    // same lock and without text logging, which would corrupt the binary stream.
+    if (rxStatus & 0x80) {
+        cc1101.setSidle();
+        cc1101.SpiStrobe(CC1101_SFRX);
+        cc1101.SetRx(currentFreqMHz_);
+        xSemaphoreGive(spiMutex);
+        return;
+    }
+
+    byte rxBytes = rxStatus & 0x7F;
+    if (!stable || rxBytes <= 1 || rxBytes > 64) {
+        xSemaphoreGive(spiMutex);
+        return;
+    }
+
+    {
+        // Leave one byte while RX continues to avoid the documented FIFO
+        // pointer race when the last byte is read as a new byte arrives.
         uint8_t buffer[64];
-        uint8_t toRead = (rxBytes > 64) ? 64 : rxBytes;
+        uint8_t toRead = rxBytes - 1;
 
         // Read data from RX FIFO
         cc1101.SpiReadBurstReg(CC1101_RXFIFO + 0xC0, buffer, toRead);
@@ -404,18 +485,6 @@ void SdrModule::pollRawRx() {
 
         streamSeqNum_++;
         totalBytesStreamed_ += toRead;
-    } else {
-        xSemaphoreGive(spiMutex);
-    }
-
-    // Check for FIFO overflow and flush if needed
-    if (rxBytes & 0x80) {
-        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10))) {
-            cc1101.SpiStrobe(CC1101_SFRX);  // Flush RX FIFO
-            cc1101.SetRx(currentFreqMHz_);   // Re-enter RX
-            xSemaphoreGive(spiMutex);
-            ESP_LOGW(TAG, "RX FIFO overflow — flushed");
-        }
     }
 }
 
@@ -504,13 +573,12 @@ bool SdrModule::processSerialCommand(const String& command) {
         uint32_t rate = cmd.substring(16).toInt();
         // CC1101 data rate range: 0.6–500 kBaud
         float kBaud = rate / 1000.0f;
-        if (kBaud >= 0.6f && kBaud <= 500.0f) {
-            setDataRate(kBaud);
+        if (kBaud >= 0.6f && kBaud <= 500.0f && setDataRate(kBaud)) {
             Serial.println("HACKRF_SUCCESS");
             Serial.printf("Data rate: %.2f kBaud\n", kBaud);
         } else {
             Serial.println("HACKRF_ERROR");
-            Serial.println("Rate out of range (600 - 500000 Baud)");
+            Serial.println("Stop RX first; SDR must be active and rate must be 600 - 500000 Baud");
         }
         return true;
     }
@@ -552,7 +620,10 @@ bool SdrModule::processSerialCommand(const String& command) {
 
     // rx_start — start raw RX streaming via serial
     if (cmd.equalsIgnoreCase("rx_start")) {
-        if (startRawRx()) {
+        // Keep the ACK/trailer ahead of the first raw bytes. The guard is
+        // recursive because startRawRx also protects state for BLE callers.
+        RawRxOutputGuard outputGuard(portMAX_DELAY);
+        if (outputGuard && startRawRx()) {
             Serial.println("HACKRF_SUCCESS");
             Serial.println("RX streaming started");
         } else {
@@ -563,6 +634,11 @@ bool SdrModule::processSerialCommand(const String& command) {
 
     // rx_stop — stop raw RX streaming
     if (cmd.equalsIgnoreCase("rx_stop")) {
+        RawRxOutputGuard outputGuard(portMAX_DELAY);
+        if (!outputGuard) {
+            Serial.println("HACKRF_ERROR");
+            return true;
+        }
         stopRawRx();
         Serial.println("HACKRF_SUCCESS");
         Serial.println("RX streaming stopped");
@@ -571,6 +647,12 @@ bool SdrModule::processSerialCommand(const String& command) {
 
     // spectrum_scan [start_mhz] [end_mhz] [step_khz]
     if (cmd.startsWith("spectrum_scan")) {
+        RawRxOutputGuard outputGuard(portMAX_DELAY);
+        if (!outputGuard || !active_ || streaming_) {
+            Serial.println("HACKRF_ERROR");
+            Serial.println("Enable SDR and stop RX before scanning");
+            return true;
+        }
         SpectrumScanConfig scanCfg;
         // Parse optional parameters
         int firstSpace = cmd.indexOf(' ');

@@ -15,6 +15,8 @@
 #if NRF_MODULE_ENABLED
 #include "modules/nrf/NrfModule.h"
 #include "modules/nrf/NrfJammer.h"
+#include "modules/nrf/NrfSpectrum.h"
+#include "modules/nrf/MouseJack.h"
 #endif
 
 #if BATTERY_MODULE_ENABLED
@@ -305,10 +307,17 @@ private:
         status.present     = NrfModule::isPresent() ? 1 : 0;
         status.initialized = NrfModule::isInitialized() ? 1 : 0;
         // Determine active state: 0=idle, 1=jamming, 2=scanning, 3=attacking, 4=spectrum
+        const MjState mouseJackState = MouseJack::getState();
         if (NrfJammer::isRunning()) {
             status.activeState = 1;  // Jamming
+        } else if (NrfSpectrum::isRunning()) {
+            status.activeState = 4;  // Spectrum analyzer
+        } else if (mouseJackState == MJ_SCANNING) {
+            status.activeState = 2;
+        } else if (mouseJackState == MJ_ATTACKING) {
+            status.activeState = 3;
         } else {
-            status.activeState = 0;  // Idle (scan/attack states set elsewhere)
+            status.activeState = 0;  // Idle, including saved targets without an active task
         }
 #else
         status.present     = 0;
