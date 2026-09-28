@@ -45,7 +45,9 @@ final class ExternalRadioApplications {
       NSWorkspace.shared.open([url], withApplicationAt: terminal, configuration: configuration) { _, error in
         DispatchQueue.main.async {
           if let error = error {
-            result(FlutterError(code: "launch_failed", message: error.localizedDescription, details: nil))
+            let nativeError = error as NSError
+            result(FlutterError(code: "launch_failed", message: error.localizedDescription,
+                details: "\(nativeError.domain) (\(nativeError.code))"))
           } else {
             result(nil)
           }

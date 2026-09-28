@@ -22,6 +22,7 @@ import '../services/binary_message_parser.dart';
 import '../services/ota_firmware_image.dart';
 import '../services/ota_transfer_service.dart';
 import '../services/ota_operation_guard.dart';
+import '../services/ota_reboot.dart';
 // import 'log_provider.dart'; // Unused import removed
 
 class BleProvider extends ChangeNotifier {
@@ -110,8 +111,10 @@ class BleProvider extends ChangeNotifier {
         'Device did not disconnect after the OTA restart command',
         timeout: const Duration(seconds: 15));
     disconnected.ignore();
-    await _writeOtaCommand(FirmwareBinaryProtocol.createOtaRebootCommand());
-    await disconnected;
+    await sendOtaRebootAndWaitForDisconnect(
+      sendReboot: () => _writeOtaCommand(FirmwareBinaryProtocol.createOtaRebootCommand()),
+      disconnected: disconnected,
+    );
     await Future<void>.delayed(const Duration(seconds: 3));
     Object? lastError;
     // Native connect/discovery/write calls each have their own deadlines.

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:evilcrow_rf2_controller/services/radio_integration_service.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -31,6 +32,45 @@ void main() {
     expect(await bundle.launcher.readAsString(), '#!/bin/sh\n');
     expect(await bundle.entry.readAsString(), '<project/>');
   });
+
+  test('export preserves binary contents across multiple stream chunks',
+      () async {
+    final bytes = Uint8List.fromList(
+        List<int>.generate(256 * 1024 + 7, (index) => index % 256));
+    await File('${staging.path}/capture.bits').writeAsBytes(bytes);
+    final bundle = await service.exportBundle(
+        staging: staging,
+        destination: Directory('${root.path}/saved'),
+        manifest: {
+          ...manifest,
+          'files': [...manifest['files'] as List<String>, 'capture.bits'],
+        });
+    await staging.delete(recursive: true);
+    expect(await File('${bundle.directory.path}/capture.bits').readAsBytes(),
+        orderedEquals(bytes));
+  });
+
+  test('export creates fresh files without staging extended attributes',
+      () async {
+    const attribute = 'com.evilcrow.export-test';
+    final source = '${staging.path}/Launch URH.command';
+    final tagged = await Process.run(
+        '/usr/bin/xattr', ['-w', attribute, 'temporary-staging', source]);
+    expect(tagged.exitCode, 0, reason: tagged.stderr.toString());
+
+    final bundle = await service.exportBundle(
+        staging: staging,
+        destination: Directory('${root.path}/saved'),
+        manifest: manifest);
+    final sourceAttributes = await Process.run('/usr/bin/xattr', [source]);
+    final exportedAttributes =
+        await Process.run('/usr/bin/xattr', [bundle.launcher.path]);
+    expect(sourceAttributes.exitCode, 0);
+    expect(sourceAttributes.stdout.toString(), contains(attribute));
+    expect(exportedAttributes.exitCode, 0);
+    expect(exportedAttributes.stdout.toString(), isNot(contains(attribute)));
+    expect(await bundle.launcher.readAsString(), '#!/bin/sh\n');
+  }, skip: !Platform.isMacOS);
 
   test('refuse path traversal and preserve existing output', () async {
     final saved = await Directory('${root.path}/saved').create();

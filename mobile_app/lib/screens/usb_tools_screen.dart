@@ -268,11 +268,18 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
               'Use Stop here when finished.';
         });
       await run;
-    } catch (_) {
+      if (mounted) {
+        setState(() => _radioStatus =
+            'Receive bridge stopped. Saved ${bundle.directory.path}');
+      }
+    } catch (error) {
       await _backend.stop();
       try {
         await run;
       } catch (_) {}
+      if (mounted) {
+        setState(() => _radioStatus = 'Could not run $target: $error');
+      }
       rethrow;
     }
   }

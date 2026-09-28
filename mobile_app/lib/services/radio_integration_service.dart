@@ -55,7 +55,15 @@ class RadioIntegrationService {
     await destination.create();
     try {
       for (final name in files) {
-        await File('${staging.path}/$name').copy('${destination.path}/$name');
+        // Export generated contents as new files under the user's folder grant.
+        // File.copy also carries the helper's staging metadata on macOS.
+        final output = File('${destination.path}/$name').openWrite();
+        try {
+          await output.addStream(File('${staging.path}/$name').openRead());
+          await output.flush();
+        } finally {
+          await output.close();
+        }
       }
       return RadioIntegrationBundle(
           destination,
