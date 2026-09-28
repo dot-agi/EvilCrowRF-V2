@@ -119,10 +119,20 @@ def parser():
         command.add_argument('--frequency', type=float, default=433.92e6)
         if name == 'urh':
             command.add_argument('--tcp-port', type=int, default=1234)
+            command.add_argument('--sample-format', choices=('bytes', 'bits'), default='bytes',
+                                 help='bits: unpack demodulated FIFO data for URH/GNU Radio integrations')
         else:
             command.add_argument('--duration', type=duration, default=5.0)
             command.add_argument('--output', type=Path, required=name == 'gnuradio')
     commands.add_parser('backup').add_argument('--output', type=Path, required=True)
+    export = commands.add_parser('integration-export')
+    export.add_argument('--target', choices=('urh', 'gnuradio'), required=True)
+    export.add_argument('--output', type=Path, required=True)
+    export.add_argument('--frequency', type=float, default=433.92e6)
+    export.add_argument('--tcp-port', type=int, default=1234)
+    export.add_argument('--input', type=Path, help='Optional packed FIFO capture from the RX command')
+    export.add_argument('--executable', type=Path,
+                        help='URH launcher or Python interpreter containing the selected application')
     for name in ('flash-preview', 'flash'):
         command = commands.add_parser(name)
         command.add_argument('--firmware', type=Path, required=True)
@@ -167,7 +177,7 @@ def receive(port, args, cancel):
 
 def bridge(port, args, cancel, events):
     from urh_bridge import URHBridge
-    receiver = URHBridge(port, args.tcp_port)
+    receiver = URHBridge(port, args.tcp_port, sample_format=args.sample_format)
     cancel.bind(receiver.request_stop)
     try:
         if cancel.event.is_set():
@@ -180,7 +190,8 @@ def bridge(port, args, cancel, events):
             return {}
         if not receiver.start_server():
             raise RuntimeError('Could not start the local RTL-TCP server')
-        events.emit('ready', operation='urh', host='127.0.0.1', tcp_port=receiver.server.getsockname()[1])
+        events.emit('ready', operation='urh', host='127.0.0.1',
+                    tcp_port=receiver.server.getsockname()[1], sample_format=args.sample_format)
         while not cancel.event.is_set():
             try:
                 client, address = receiver.server.accept()
@@ -207,6 +218,10 @@ def run(args, cancel, events):
         plan, _, _ = firmware_tool.prepare_flash(args.firmware, args.backup)
         events.emit('plan', plan=plan)
         return {'plan': plan}
+    if operation == 'integration-export':
+        from radio_integrations import export_integration
+        return export_integration(args.target, args.output, args.frequency,
+                                  args.tcp_port, args.input, args.executable)
     if hasattr(args, 'frequency') and not is_valid_frequency(args.frequency):
         raise ValueError('Frequency must be within a CC1101 band')
     if operation == 'urh' and not 1 <= args.tcp_port <= 65535:

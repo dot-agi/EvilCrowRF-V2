@@ -22,6 +22,7 @@ class UsbBackendService extends ChangeNotifier {
   final List<String> _lines = [];
   Process? _process;
   Future<void>? _done;
+  Completer<Map<String, dynamic>>? _ready;
   bool _disposed = false;
   bool _cancelRequested = false;
   bool _cancellable = false;
@@ -33,7 +34,11 @@ class UsbBackendService extends ChangeNotifier {
   Map<String, dynamic>? result;
   List<String> get lines => List.unmodifiable(_lines);
   bool get canStop => busy && _cancellable && !critical;
+  bool get stopRequested => _cancelRequested;
   Future<void> get finished => _done ?? Future<void>.value();
+  Future<Map<String, dynamic>> get whenReady =>
+      _ready?.future ??
+      Future.error(StateError('No external radio bridge is starting'));
 
   void _changed() {
     if (!_disposed) notifyListeners();
@@ -74,6 +79,21 @@ class UsbBackendService extends ChangeNotifier {
     try {
       final event = jsonDecode(line) as Map<String, dynamic>;
       switch (event['event']) {
+        case 'ready':
+          if (_ready != null && !_ready!.isCompleted) {
+            final port = event['tcp_port'];
+            if (event['host'] != '127.0.0.1' ||
+                port is! int ||
+                port < 1 ||
+                port > 65535) {
+              _ready!.completeError(
+                  const FormatException('Invalid local bridge endpoint'));
+            } else {
+              _ready!.complete(event);
+            }
+          }
+          _log('Receive bridge ready on ${event['host']}:${event['tcp_port']}');
+          break;
         case 'plan':
           plan = Map<String, dynamic>.from(event['plan'] as Map);
           _log('Firmware plan ready');
@@ -108,6 +128,8 @@ class UsbBackendService extends ChangeNotifier {
     _cancelRequested = false;
     plan = null;
     result = null;
+    _ready = operation == 'urh' ? Completer<Map<String, dynamic>>() : null;
+    _ready?.future.ignore();
     _lines.clear();
     status = 'Running $operation';
     final completion = Completer<void>();
@@ -153,6 +175,10 @@ class UsbBackendService extends ChangeNotifier {
       _log(status);
       rethrow;
     } finally {
+      if (_ready != null && !_ready!.isCompleted) {
+        _ready!.completeError(
+            StateError('Bridge exited before it was ready: $status'));
+      }
       _process = null;
       if (critical) {
         try {

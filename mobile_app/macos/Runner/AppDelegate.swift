@@ -4,12 +4,13 @@ import FlutterMacOS
 @main
 class AppDelegate: FlutterAppDelegate, NSWindowDelegate {
   var usbCriticalOperation = false
+  var otaCriticalOperation = false
 
   private func allowClosing() -> Bool {
-    if !usbCriticalOperation { return true }
+    if !usbCriticalOperation && !otaCriticalOperation { return true }
     let alert = NSAlert()
-    alert.messageText = "USB operation in progress"
-    alert.informativeText = "Keep the device connected and wait for backup or firmware verification to finish before closing."
+    alert.messageText = otaCriticalOperation ? "Firmware update in progress" : "USB operation in progress"
+    alert.informativeText = "Keep the device connected and wait for backup or firmware and restart verification to finish before closing."
     alert.addButton(withTitle: "Keep Open")
     alert.runModal()
     return false

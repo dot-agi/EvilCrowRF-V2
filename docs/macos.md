@@ -1,5 +1,8 @@
 # EvilCrow RF on macOS
 
+For verified Bluetooth firmware updates and launching the actual URH/GNU Radio
+applications from Flutter, see [BLE OTA and radio integrations](macos-integrations.md).
+
 ## App and connections
 
 The macOS Flutter controller provides both Bluetooth controls and USB tools in

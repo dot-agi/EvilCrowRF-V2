@@ -5,10 +5,12 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../providers/ble_provider.dart';
 import '../services/usb_backend_service.dart';
 import '../services/usb_backup_files.dart';
+import '../services/radio_integration_service.dart';
 
 class UsbToolsScreen extends StatefulWidget {
   const UsbToolsScreen({super.key});
@@ -31,6 +33,11 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
   String _firmwareLabel = '';
   String _backupLabel = '';
   bool _preparing = false;
+  final _radioApps = RadioIntegrationService();
+  RadioIntegrationBundle? _radioBundle;
+  String _radioStatus = '';
+  String? _urhExecutable;
+  String? _gnuPython;
 
   bool get _busy => _preparing || _backend.busy;
 
@@ -44,6 +51,47 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
   void initState() {
     super.initState();
     _backend.addListener(_updated);
+    unawaited(_loadRadioExecutables());
+  }
+
+  Future<void> _loadRadioExecutables() async {
+    final preferences = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _urhExecutable = preferences.getString('radio_urh_executable');
+      _gnuPython = preferences.getString('radio_gnuradio_executable');
+    });
+  }
+
+  Future<void> _chooseRadioExecutable(String target) async {
+    final selection = await FilePicker.platform.pickFiles(
+        dialogTitle: target == 'urh'
+            ? 'Choose URH executable or Python with URH installed'
+            : 'Choose Python with GNU Radio installed',
+        type: FileType.any);
+    final path = selection?.files.single.path;
+    if (path == null || !mounted) return;
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString('radio_${target}_executable', path);
+    if (!mounted) return;
+    setState(() {
+      if (target == 'urh') {
+        _urhExecutable = path;
+      } else {
+        _gnuPython = path;
+      }
+    });
+  }
+
+  Future<void> _resetRadioExecutables() async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove('radio_urh_executable');
+    await preferences.remove('radio_gnuradio_executable');
+    if (mounted)
+      setState(() {
+        _urhExecutable = null;
+        _gnuPython = null;
+      });
   }
 
   void _updated() {
@@ -87,7 +135,9 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
 
   Future<Map<String, dynamic>> _run(String command,
       {List<String> arguments = const [], bool critical = false}) async {
-    if (command != 'list-ports' && command != 'flash-preview') {
+    if (command != 'list-ports' &&
+        command != 'flash-preview' &&
+        command != 'integration-export') {
       final ble = context.read<BleProvider>();
       if (ble.isConnected) await ble.disconnect();
     }
@@ -138,8 +188,100 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
     if (tcp == null || tcp < 1024 || tcp > 65535) {
       throw const FormatException('TCP port must be 1024–65535');
     }
-    await _run('urh',
-        arguments: ['--frequency', frequency, '--tcp-port', '$tcp']);
+    await _run('urh', arguments: [
+      '--frequency',
+      frequency,
+      '--tcp-port',
+      '$tcp',
+      '--sample-format',
+      'bits'
+    ]);
+  }
+
+  Future<RadioIntegrationBundle?> _prepareRadioIntegration(
+      String target) async {
+    final frequency = _receiveArguments()[1];
+    final tcp = int.tryParse(_tcpPort.text);
+    if (tcp == null || tcp < 1024 || tcp > 65535) {
+      throw const FormatException('TCP port must be 1024–65535');
+    }
+    final folder = await FilePicker.platform.getDirectoryPath(
+        dialogTitle:
+            'Save ${target == 'urh' ? 'URH project' : 'GNU Radio flowgraph'}');
+    if (folder == null || !mounted) return null;
+    final id = DateTime.now().microsecondsSinceEpoch;
+    final staging = Directory('${(await _workspace).path}/$target-$id');
+    final executable = target == 'urh' ? _urhExecutable : _gnuPython;
+    final manifest = await _run('integration-export', arguments: [
+      '--target',
+      target,
+      '--output',
+      staging.path,
+      '--frequency',
+      frequency,
+      '--tcp-port',
+      '$tcp',
+      if (executable != null) ...['--executable', executable],
+      if (_capture != null && _capture!.path.endsWith('.bin')) ...[
+        '--input',
+        _capture!.path
+      ],
+    ]);
+    final bundle = await _radioApps.exportBundle(
+        staging: staging,
+        destination: Directory('$folder/evilcrow-$target-$id'),
+        manifest: manifest);
+    if (mounted)
+      setState(() {
+        _radioBundle = bundle;
+        _radioStatus = 'Saved ${bundle.directory.path}';
+      });
+    return bundle;
+  }
+
+  Future<void> _startRadioApplication(String target) async {
+    final bundle = await _prepareRadioIntegration(target);
+    if (bundle == null || !mounted) return;
+    final ble = context.read<BleProvider>();
+    if (ble.isConnected) await ble.disconnect();
+    final run = _backend.run('urh', port: _port, arguments: [
+      '--frequency',
+      _receiveArguments()[1],
+      '--tcp-port',
+      _tcpPort.text,
+      '--sample-format',
+      'bits',
+    ]);
+    // Attach immediately so a failed bridge startup cannot become an unhandled
+    // asynchronous error while waiting for its ready event.
+    run.ignore();
+    try {
+      await _backend.whenReady.timeout(const Duration(seconds: 45));
+      if (!_backend.busy || _backend.stopRequested) {
+        throw StateError('The receive bridge has stopped');
+      }
+      await _radioApps.launch(bundle);
+      if (mounted)
+        setState(() {
+          _radioStatus =
+              'Launch requested. Keep this bridge running while receiving. '
+              'Use Stop here when finished.';
+        });
+      await run;
+      if (mounted) {
+        setState(() => _radioStatus =
+            'Receive bridge stopped. Saved ${bundle.directory.path}');
+      }
+    } catch (error) {
+      await _backend.stop();
+      try {
+        await run;
+      } catch (_) {}
+      if (mounted) {
+        setState(() => _radioStatus = 'Could not run $target: $error');
+      }
+      rethrow;
+    }
   }
 
   Future<void> _pickFirmware() async {
@@ -394,13 +536,14 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
                                   controller: _tcpPort,
                                   enabled: !_busy,
                                   decoration: const InputDecoration(
-                                      labelText: 'URH TCP port'))),
+                                      labelText: 'Local TCP port'))),
                         ]),
                         const SizedBox(height: 10),
                         Wrap(spacing: 8, runSpacing: 8, children: [
                           _button('Receive demo', Icons.radio,
                               () => _captureBytes('rx')),
-                          _button('URH bridge', Icons.cable, _startBridge),
+                          _button('Project receive bridge', Icons.cable,
+                              _startBridge),
                           _button('GNU Radio capture', Icons.graphic_eq,
                               () => _captureBytes('gnuradio')),
                           _button('Save capture', Icons.save_alt, _saveCapture,
@@ -409,6 +552,63 @@ class _UsbToolsScreenState extends State<UsbToolsScreen> {
                         const Text(
                             'CC1101 output is demodulated data. URH/GNU Radio formats use synthetic samples; '
                             'they are not true IQ. The URH desktop application is installed separately.'),
+                        const SizedBox(height: 20),
+                        Text('External radio applications',
+                            style: Theme.of(context).textTheme.titleMedium),
+                        const SizedBox(height: 8),
+                        const Text(
+                            'Save a project or flowgraph, start the local receive bridge, '
+                            'then open the application. URH opens its Receive window; press Start there. '
+                            'GNU Radio opens a live time plot. The stream contains demodulated ASK bits.'),
+                        const SizedBox(height: 10),
+                        Wrap(spacing: 8, runSpacing: 8, children: [
+                          _button('Start URH', Icons.open_in_new,
+                              () => _startRadioApplication('urh')),
+                          _button('Start GNU Radio', Icons.show_chart,
+                              () => _startRadioApplication('gnuradio')),
+                          _button(
+                              'Export URH project', Icons.folder_copy_outlined,
+                              () async {
+                            await _prepareRadioIntegration('urh');
+                          }),
+                          _button('Export GNU Radio flowgraph', Icons.save_alt,
+                              () async {
+                            await _prepareRadioIntegration('gnuradio');
+                          }),
+                          OutlinedButton.icon(
+                              onPressed: _radioBundle == null
+                                  ? null
+                                  : () async {
+                                      try {
+                                        await _radioApps.reveal(_radioBundle!);
+                                      } catch (error) {
+                                        _message(error);
+                                      }
+                                    },
+                              icon: const Icon(Icons.folder_open, size: 18),
+                              label: const Text('Show exported folder')),
+                        ]),
+                        ExpansionTile(
+                          title: const Text('Application locations'),
+                          subtitle: const Text(
+                              'Homebrew locations are detected automatically.'),
+                          children: [
+                            ListTile(
+                                title: const Text('URH executable or Python'),
+                                subtitle: Text(_urhExecutable ?? 'Automatic'),
+                                trailing: _button('Choose', Icons.file_open,
+                                    () => _chooseRadioExecutable('urh'))),
+                            ListTile(
+                                title: const Text('GNU Radio Python'),
+                                subtitle: Text(_gnuPython ?? 'Automatic'),
+                                trailing: _button('Choose', Icons.file_open,
+                                    () => _chooseRadioExecutable('gnuradio'))),
+                            _button('Use automatic locations', Icons.restore,
+                                _resetRadioExecutables),
+                          ],
+                        ),
+                        if (_radioStatus.isNotEmpty)
+                          SelectableText(_radioStatus),
                         const Divider(height: 28),
                         Text('Firmware and recovery',
                             style: Theme.of(context).textTheme.titleMedium),

@@ -170,4 +170,43 @@ void main() {
     expect(service.busy, isFalse);
     service.dispose();
   });
+
+  test('external application waits for the confirmed local bridge endpoint',
+      () async {
+    final child = _Process();
+    final service = UsbBackendService(
+        executable: '/test/helper', startProcess: (_, __) async => child);
+    final run = service.run('urh');
+    var ready = false;
+    final endpoint = service.whenReady.then((value) {
+      ready = true;
+      return value;
+    });
+    await _tick();
+    child.write('{"event":"log","message":"starting"}\n');
+    await _tick();
+    expect(ready, isFalse);
+    child.write('{"event":"ready","host":"127.0.0.1","tcp_port":1234}\n');
+    expect((await endpoint)['tcp_port'], 1234);
+    expect(service.busy, isTrue);
+    child.write('{"event":"result","ok":true}\n');
+    await child.finish();
+    await run;
+    service.dispose();
+  });
+
+  test('bridge failure rejects readiness without launching an application',
+      () async {
+    final child = _Process();
+    final service = UsbBackendService(
+        executable: '/test/helper', startProcess: (_, __) async => child);
+    final run = service.run('urh');
+    final failedRun = expectLater(run, throwsStateError);
+    final failedReady = expectLater(service.whenReady, throwsStateError);
+    await _tick();
+    child.write('{"event":"error","message":"port busy"}\n');
+    await child.finish(1);
+    await Future.wait([failedRun, failedReady]);
+    service.dispose();
+  });
 }
