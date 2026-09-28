@@ -205,9 +205,9 @@ against the device and exported with a valid checksum sidecar; two serial-read
 retries recovered during that run. The final independent app then imported
 that exported backup, previewed and wrote the selected 1.1.4 application image,
 verified its device hash, and restarted successfully. Post-update USB reception,
-Bluetooth connection after a fresh scan, and SD directory listing passed.
-The app now waits for CoreBluetooth initialization before connecting to a
-remembered device; cold connection is being rechecked in the rebuilt package.
+Bluetooth connection, and SD directory listing passed. The final native suite
+also passed cold remembered-device connection before any discovery scan,
+followed by the remaining workflows and cleanup: 18 checks in 50 seconds.
 
 Backups include internal firmware and settings, but exclude the microSD card.
 Keep them private. The backup reader uses small requests, bounded retries, and

@@ -27,7 +27,7 @@ The device used for these live tests ran separately built **1.1.4** firmware,
 | Button-free bootloader/restart | CLI and Flutter GUI operations completed; restart logged successful SD initialization | Depends on the board's auto-reset circuit |
 | Live RTL-TCP bridge | Two local clients received 1,181 and 1,177 samples excluding padding; retuning, reconnect and stop passed | External URH desktop UI was not used |
 | Live GNU source | Received 512 samples, retuned, received another 512; stop passed | Source helper used without a GNU Radio runtime flowgraph |
-| Flutter native BLE suite | All 14 workflows and three cleanup checks passed on the installed image | Detailed coverage below |
+| Flutter native BLE suite | All 18 checks passed in 50 seconds, including cold connection and three cleanup checks | Detailed coverage below |
 | Flutter packaged USB discovery/status | Device discovered and status returned through the embedded helper | Does not test RF sensitivity |
 | Flutter packaged receive/export | Captured 2,393 raw bytes and exported them through the native save panel | Demodulated data may be noise |
 | Flutter packaged GNU capture/export | Captured 2,376 synthetic complex samples and exported 19,008 bytes in complex64 format | GNU Radio runtime was not used |
@@ -35,7 +35,7 @@ The device used for these live tests ran separately built **1.1.4** firmware,
 | Flutter GUI backup/export | Full 4 MiB read and device-MD5 verification passed; exported SHA-256 sidecar names and matches the saved image | Two serial-read retries recovered |
 | Flutter GUI firmware installation | Final independent package imported the exported backup, previewed the selected image, wrote 1,205,888 bytes to app0 at `0x10000`, verified its hash and restarted | Application partition only |
 | Post-update USB receive | Captured 2,406 bytes in five seconds; stop acknowledged; final state inactive and not streaming | Demodulated data may be noise |
-| Post-update BLE and SD | Connected after a fresh scan, reported firmware 1.1.4, and listed the SD `DATA` folders | Cold remembered-device connection is being rechecked after an initialization fix |
+| Post-update BLE and SD | Reported firmware 1.1.4, listed the SD `DATA` folders, and passed a cold direct connection before any discovery scan | Native cold connection completed in 4,061 ms |
 | Flutter critical-operation Quit guard | Cmd-Q displayed Keep Open during the active backup; backup continued to completion | Normal application quit, not forced process termination |
 | Flutter GUI backup preflight | Rejected unreadable flash IDs `0xffffff` and `0x000000`; no flash write occurred | A full power cycle was needed before the successful backup |
 | Button mapping persistence | Mapping survived restart; original mappings restored | No physical button press tested |
@@ -53,9 +53,10 @@ decoding remains unverified.
 
 Local receipts include `macos_usb_1.1.4_clean_rx.json`,
 `macos-firmware-1.1.4-nrf-status-flash-retry.log`,
-`macos-live-adapters-e2e.log`, and `macos-flutter-device-e2e.log`. Device logs and
-full flash backups remain local because they can contain settings and nearby
-Bluetooth identifiers.
+`macos-live-adapters-e2e.log`, `macos-flutter-device-e2e.log`, and
+`macos-independent-final-device-e2e-results.json`. Device logs and full flash
+backups remain local because they can contain settings and nearby Bluetooth
+identifiers.
 
 ## Host tests with simulated hardware
 
@@ -98,12 +99,15 @@ Bluetooth cases cover a delayed powered-on state, repeated Connect clicks,
 permission denial, powered-off state, and a ten-second initialization timeout.
 These tests use fake BLE/process objects and local temporary files.
 
-The native macOS integration suite passed in 39 seconds with the real Flutter
-app and BLE device. It checks fresh device responses after asynchronous
-operations rather than relying on optimistic app state.
+The final native macOS integration suite passed all 18 checks in 50 seconds
+with the real Flutter app and BLE device. It checks fresh device responses
+after asynchronous operations rather than relying on optimistic app state.
+The cold connection check runs before any discovery scan or test-side wait for
+Bluetooth readiness.
 
 | Case | Result |
 | --- | --- |
+| Cold remembered-device connection | Passed in 4,061 ms without a preliminary scan |
 | Discovery, connection, version and state | Passed |
 | Connected navigation views | Passed |
 | Device name and settings change/readback/restoration | Passed |
@@ -131,11 +135,10 @@ SHA-256 is recorded above. The confirmation showed that exact hash and app0 at
 `0x10000`. The write transferred 683,460 compressed bytes in 67.1 seconds,
 verified the device hash, restarted the board, and returned `ok: true`.
 After the update, a five-second USB receive captured 2,406 bytes, acknowledged
-Stop, and reported inactive/non-streaming status. Bluetooth reconnected after a
-fresh scan, reported firmware 1.1.4, and listed the SD `DATA` folders. A cold
-remembered-device connection exposed CoreBluetooth's initial unknown state;
-the app now waits for a resolved adapter state before connecting. The cold
-connection is being rechecked in the rebuilt package.
+Stop, and reported inactive/non-streaming status. Bluetooth reported firmware
+1.1.4 and listed the SD `DATA` folders. The rebuilt app then passed the native
+cold remembered-device connection check without a preliminary scan, followed
+by discovery, reconnect and all remaining workflows and cleanup checks.
 
 The app release was rebuilt directly from `main` plus this app/host change set,
 without the firmware PR. The build generated its own USB helper and passed
@@ -189,7 +192,6 @@ are reported and retained.
 | Known-signal capture and protocol decoding | An owned transmitter with known frequency, modulation, and payload |
 | Physical buttons | Press each user button and verify the selected action; test RESET separately |
 | URH / GNU Radio desktop integration | Run the external application or runtime flowgraph; local adapter transport has passed |
-| Cold remembered-device connection | Recheck the rebuilt app without a preliminary device scan |
 | BLE OTA | Complete transfer, validation, reboot, and version check with a fresh backup |
 | Replay, emulation, brute-force, nRF HID/string/Ducky, jamming | Scoped owned receiver and isolated RF setup appropriate to the operation |
 | Factory reset and SD format | Explicit destructive test with a verified backup and restoration plan |

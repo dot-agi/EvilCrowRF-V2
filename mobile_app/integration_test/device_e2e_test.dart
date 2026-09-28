@@ -155,6 +155,18 @@ void main() {
     }
 
     try {
+      // Exercise the remembered-device path before any scan or test-side
+      // adapter readiness wait. The provider must handle CoreBluetooth startup.
+      await check('cold_cached_connect', () async {
+        try {
+          await ble.connectToDevice(BluetoothDevice.fromId(deviceId));
+          await until(() => ble.isConnected && ble.settingsSynced,
+              'direct connection without a discovery scan');
+        } finally {
+          await ble.disconnect();
+          await until(() => !ble.isConnected, 'direct-connection cleanup');
+        }
+      });
       await until(
           () => FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on,
           'Bluetooth enabled',

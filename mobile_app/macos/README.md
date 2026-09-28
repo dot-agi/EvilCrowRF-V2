@@ -166,7 +166,8 @@ skipped. The expected firmware version is optional; use the version installed
 on your device when checking a different build. Allow the native Bluetooth
 permission prompt if it appears.
 
-The test checks discovery, reconnect, device status, scanner navigation
+The test checks cold remembered-device connection before scanning, discovery,
+reconnect, device status, scanner navigation
 cleanup, temporary file create/upload/read/rename/copy/move/delete on LittleFS
 and SD, button mapping readback and restoration, passive recording, ProtoPirate
 decoding, and the NRF spectrum. It creates uniquely named test files and removes
