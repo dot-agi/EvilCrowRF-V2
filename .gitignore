@@ -15,3 +15,7 @@ SDR/build
 SDR/dist
 SDR/upx
 SDR/sdr_launcher.spec
+.tools/
+__pycache__/
+*.py[cod]
+SDR/EvilCrow SDR.spec

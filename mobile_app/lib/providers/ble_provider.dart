@@ -22,6 +22,64 @@ import '../services/binary_message_parser.dart';
 // import 'log_provider.dart'; // Unused import removed
 
 class BleProvider extends ChangeNotifier {
+  bool _disposed = false;
+  bool _isConnecting = false;
+
+  @protected
+  Stream<BluetoothAdapterState> get adapterStates => FlutterBluePlus.adapterState;
+
+  String _adapterMessage(BluetoothAdapterState state) {
+    switch (state) {
+      case BluetoothAdapterState.on:
+        return '';
+      case BluetoothAdapterState.unknown:
+      case BluetoothAdapterState.turningOn:
+        return 'Bluetooth initializing...';
+      case BluetoothAdapterState.unauthorized:
+        return 'Bluetooth permission denied. Allow Bluetooth access in system settings.';
+      case BluetoothAdapterState.unavailable:
+        return 'Bluetooth is unavailable';
+      case BluetoothAdapterState.turningOff:
+        return 'Bluetooth is turning off';
+      case BluetoothAdapterState.off:
+        return 'Bluetooth disabled';
+    }
+  }
+
+  Future<void> _waitForBluetooth() async {
+    final ready = Completer<BluetoothAdapterState>();
+    final subscription = adapterStates.listen((state) {
+      if (state != BluetoothAdapterState.unknown &&
+          state != BluetoothAdapterState.turningOn && !ready.isCompleted) {
+        ready.complete(state);
+      }
+    }, onError: (Object error, StackTrace stack) {
+      if (!ready.isCompleted) ready.completeError(error, stack);
+    }, onDone: () {
+      if (!ready.isCompleted) {
+        ready.completeError(StateError('Bluetooth adapter state is unavailable'));
+      }
+    });
+    try {
+      final state = await ready.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw TimeoutException(
+            'Bluetooth initialization timed out. Try again or reopen the app.'),
+      );
+      if (_disposed) throw StateError('Bluetooth controller has closed');
+      if (state != BluetoothAdapterState.on) {
+        throw StateError(_adapterMessage(state));
+      }
+    } finally {
+      await subscription.cancel();
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
   BluetoothDevice? connectedDevice;
   BluetoothCharacteristic? txCharacteristic;
   BluetoothCharacteristic? rxCharacteristic;
@@ -57,21 +115,25 @@ class BleProvider extends ChangeNotifier {
   
   // Method for setting logging callback
   void setLogCallback(Function(String level, String message, {String? details}) callback) {
+    if (_disposed) return;
     _logCallback = callback;
   }
 
   // Method for setting notification callback (for user-facing notifications)
   void setNotificationCallback(Function(String level, String message) callback) {
+    if (_disposed) return;
     _notificationCallback = callback;
   }
 
   // Helper to fire a user-facing notification
   void _notify(String level, String message) {
+    if (_disposed) return;
     _notificationCallback?.call(level, message);
   }
   
   // Helper method for logging
   void _log(String level, String message, {String? details}) {
+    if (_disposed) return;
     _logCallback?.call(level, message, details: details);
   }
   
@@ -291,15 +353,13 @@ class BleProvider extends ChangeNotifier {
   Future<void> _initializeBle() async {
     // Request permissions
     await requestPermissions();
+    if (_disposed) return;
     
     // Listen to Bluetooth state changes
     _adapterStateSubscription?.cancel();
-    _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
-      if (state == BluetoothAdapterState.on) {
-        // Don't show "Bluetooth enabled" message
-        statusMessage = '';
-      } else {
-        statusMessage = 'Bluetooth disabled';
+    _adapterStateSubscription = adapterStates.listen((state) {
+      statusMessage = _adapterMessage(state);
+      if (state != BluetoothAdapterState.on) {
         isConnected = false;
         connectedDevice = null;
       }
@@ -357,6 +417,11 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> requestPermissions() async {
+    // CoreBluetooth owns the system permission prompt on macOS and iOS.
+    // permission_handler has no macOS implementation, and Android's scan /
+    // location permission gates do not apply on Apple platforms.
+    if (!Platform.isAndroid) return;
+
     // Basic Bluetooth permissions
     if (await Permission.bluetooth.isDenied) {
       await Permission.bluetooth.request();
@@ -452,6 +517,7 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<bool> _checkScanPermissions() async {
+    if (!Platform.isAndroid) return true;
     return await Permission.bluetooth.isGranted &&
            await Permission.bluetoothScan.isGranted &&
            await Permission.location.isGranted;
@@ -507,7 +573,12 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
+    if (_isConnecting || _disposed) return;
+    _isConnecting = true;
     try {
+      // CoreBluetooth initially reports unknown while its manager starts.
+      // A cached device can be selected before the first resolved state.
+      await _waitForBluetooth();
       statusMessage = 'connecting'; // Key for localization
       _log('info', 'Attempting to connect to device', details: 'Device: ${device.name} (${device.id})');
       print('Connecting to device: ${device.name} (${device.id})');
@@ -567,9 +638,11 @@ class BleProvider extends ChangeNotifier {
          // Listen to notifications on RX characteristic (cancel previous on reconnect)
          await rxCharacteristic!.setNotifyValue(true);
          
-         // Request MTU increase for better performance
+         // CoreBluetooth negotiates MTU automatically on Apple platforms.
          try {
-           int mtu = await device.requestMtu(512);
+           int mtu = Platform.isAndroid
+               ? await device.requestMtu(512)
+               : device.mtuNow;
            print('MTU negotiated: $mtu');
            _log('info', 'MTU negotiated', details: 'MTU: $mtu');
          } catch (e) {
@@ -634,6 +707,8 @@ class BleProvider extends ChangeNotifier {
     } catch (e) {
       statusMessage = 'Connection error: $e';
       notifyListeners();
+    } finally {
+      _isConnecting = false;
     }
   }
 
@@ -2676,8 +2751,12 @@ class BleProvider extends ChangeNotifier {
       final int chunkId = DateTime.now().millisecondsSinceEpoch & 0xFF;
 
       // Create completer for upload response
-      _pendingUploadCompleter?.completeError('New upload started');
-      _pendingUploadCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingUploadCompleter != null && !_pendingUploadCompleter!.isCompleted) {
+        _pendingUploadCompleter!.completeError('New upload started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingUploadCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
 
       // Send first chunk with path
       final firstChunk = FirmwareBinaryProtocol.createUploadFileStartCommand(
@@ -2733,14 +2812,16 @@ class BleProvider extends ChangeNotifier {
 
       // Wait for upload response with timeout
       final timeout = Timer(const Duration(seconds: 30), () {
-        if (_pendingUploadCompleter != null && !_pendingUploadCompleter!.isCompleted) {
-          _pendingUploadCompleter!.completeError('Upload timeout');
-          _pendingUploadCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Upload timeout');
+          if (identical(_pendingUploadCompleter, completer)) {
+            _pendingUploadCompleter = null;
+          }
         }
       });
 
       try {
-        final response = await _pendingUploadCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         _uploadProgress = 1.0;
         onProgress?.call(1.0);
@@ -2754,7 +2835,9 @@ class BleProvider extends ChangeNotifier {
         notifyListeners();
         rethrow;
       } finally {
-        _pendingUploadCompleter = null;
+        if (identical(_pendingUploadCompleter, completer)) {
+          _pendingUploadCompleter = null;
+        }
       }
     } catch (e) {
       _isUploading = false;
@@ -2774,6 +2857,8 @@ class BleProvider extends ChangeNotifier {
     Function(double progress)? onProgress,
   }) async {
     final tempDir = await getTemporaryDirectory();
+    // The macOS cache path may not exist yet on the first upload.
+    await tempDir.create(recursive: true);
     final tempFile = File('${tempDir.path}/_upload_tmp_${DateTime.now().millisecondsSinceEpoch}');
     try {
       await tempFile.writeAsBytes(bytes);
@@ -4148,22 +4233,28 @@ class BleProvider extends ChangeNotifier {
       final command = FirmwareBinaryProtocol.createRenameFileCommand(relativePath, newPath, pathType: effectivePathType);
       
       // Create completer to wait for response
-      _pendingRenameCompleter?.completeError('New rename operation started');
-      _pendingRenameCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingRenameCompleter != null && !_pendingRenameCompleter!.isCompleted) {
+        _pendingRenameCompleter!.completeError('New rename operation started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingRenameCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
       
       await sendBinaryCommand(command);
       
       // Set timeout
       Timer timeout = Timer(const Duration(seconds: 10), () {
-        if (_pendingRenameCompleter != null && !_pendingRenameCompleter!.isCompleted) {
-          _pendingRenameCompleter!.completeError('Timeout waiting for rename response');
-          _pendingRenameCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Timeout waiting for rename response');
+          if (identical(_pendingRenameCompleter, completer)) {
+            _pendingRenameCompleter = null;
+          }
         }
       });
       
       try {
         // Wait for response
-        final response = await _pendingRenameCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         
         final success = response['success'] ?? false;
@@ -4180,7 +4271,9 @@ class BleProvider extends ChangeNotifier {
         _log('error', 'Error waiting for rename response: $e');
         return false;
       } finally {
-        _pendingRenameCompleter = null;
+        if (identical(_pendingRenameCompleter, completer)) {
+          _pendingRenameCompleter = null;
+        }
       }
     } catch (e) {
       _log('error', 'Error renaming file: $e');
@@ -4225,21 +4318,27 @@ class BleProvider extends ChangeNotifier {
       final command = FirmwareBinaryProtocol.createRemoveFileCommand(fileName, pathType: effectivePathType);
       
       // Create completer to wait for firmware response
-      _pendingDeleteCompleter?.completeError('New delete operation started');
-      _pendingDeleteCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingDeleteCompleter != null && !_pendingDeleteCompleter!.isCompleted) {
+        _pendingDeleteCompleter!.completeError('New delete operation started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingDeleteCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
       
       await sendBinaryCommand(command);
       
       // Set timeout
       Timer timeout = Timer(const Duration(seconds: 10), () {
-        if (_pendingDeleteCompleter != null && !_pendingDeleteCompleter!.isCompleted) {
-          _pendingDeleteCompleter!.completeError('Timeout waiting for delete response');
-          _pendingDeleteCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Timeout waiting for delete response');
+          if (identical(_pendingDeleteCompleter, completer)) {
+            _pendingDeleteCompleter = null;
+          }
         }
       });
       
       try {
-        final response = await _pendingDeleteCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         
         final success = response['success'] ?? false;
@@ -4256,7 +4355,9 @@ class BleProvider extends ChangeNotifier {
         _log('error', 'Error waiting for delete response: $e');
         return false;
       } finally {
-        _pendingDeleteCompleter = null;
+        if (identical(_pendingDeleteCompleter, completer)) {
+          _pendingDeleteCompleter = null;
+        }
       }
     } catch (e) {
       _log('error', 'Error deleting file: $e');
@@ -4278,8 +4379,12 @@ class BleProvider extends ChangeNotifier {
       _log('command', 'Moving file: $sourcePath -> $destinationPath (sourcePathType: $effectiveSourcePathType, destPathType: $effectiveDestPathType)');
       
       // Create completer for move response
-      _pendingMoveCompleter?.completeError('New move request started');
-      _pendingMoveCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingMoveCompleter != null && !_pendingMoveCompleter!.isCompleted) {
+        _pendingMoveCompleter!.completeError('New move request started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingMoveCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
       
       // Create binary command with separate pathTypes
       final command = FirmwareBinaryProtocol.createMoveFileCommand(
@@ -4294,14 +4399,16 @@ class BleProvider extends ChangeNotifier {
       
       // Wait for response with timeout
       final timeout = Timer(const Duration(seconds: 30), () {
-        if (_pendingMoveCompleter != null && !_pendingMoveCompleter!.isCompleted) {
-          _pendingMoveCompleter!.completeError('Move timeout');
-          _pendingMoveCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Move timeout');
+          if (identical(_pendingMoveCompleter, completer)) {
+            _pendingMoveCompleter = null;
+          }
         }
       });
       
       try {
-        final response = await _pendingMoveCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         
         if (response['success'] == true) {
@@ -4338,7 +4445,9 @@ class BleProvider extends ChangeNotifier {
         _log('error', 'Error moving file: $e');
         rethrow;
       } finally {
-        _pendingMoveCompleter = null;
+        if (identical(_pendingMoveCompleter, completer)) {
+          _pendingMoveCompleter = null;
+        }
       }
     } catch (e) {
       _log('error', 'Error moving file: $e');
@@ -4361,8 +4470,12 @@ class BleProvider extends ChangeNotifier {
       _log('command', 'Copying file: $sourcePath -> $destinationPath');
       
       // Create completer for copy response
-      _pendingCopyCompleter?.completeError('New copy request started');
-      _pendingCopyCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingCopyCompleter != null && !_pendingCopyCompleter!.isCompleted) {
+        _pendingCopyCompleter!.completeError('New copy request started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingCopyCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
       
       // Create binary command
       final command = FirmwareBinaryProtocol.createCopyFileCommand(
@@ -4376,14 +4489,16 @@ class BleProvider extends ChangeNotifier {
       
       // Wait for response with timeout
       final timeout = Timer(const Duration(seconds: 30), () {
-        if (_pendingCopyCompleter != null && !_pendingCopyCompleter!.isCompleted) {
-          _pendingCopyCompleter!.completeError('Copy timeout');
-          _pendingCopyCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Copy timeout');
+          if (identical(_pendingCopyCompleter, completer)) {
+            _pendingCopyCompleter = null;
+          }
         }
       });
       
       try {
-        final response = await _pendingCopyCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         
         if (response['success'] == true) {
@@ -4419,7 +4534,9 @@ class BleProvider extends ChangeNotifier {
         _log('error', 'Error copying file: $e');
         rethrow;
       } finally {
-        _pendingCopyCompleter = null;
+        if (identical(_pendingCopyCompleter, completer)) {
+          _pendingCopyCompleter = null;
+        }
       }
     } catch (e) {
       _log('error', 'Error copying file: $e');
@@ -4447,21 +4564,27 @@ class BleProvider extends ChangeNotifier {
       final command = FirmwareBinaryProtocol.createCreateDirectoryCommand(dirName, pathType: effectivePathType);
       
       // Create completer to wait for firmware response
-      _pendingMkdirCompleter?.completeError('New mkdir operation started');
-      _pendingMkdirCompleter = Completer<Map<String, dynamic>>();
+      if (_pendingMkdirCompleter != null && !_pendingMkdirCompleter!.isCompleted) {
+        _pendingMkdirCompleter!.completeError('New mkdir operation started');
+      }
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingMkdirCompleter = completer;
+      completer.future.ignore(); // A reply can arrive before the write finishes.
       
       await sendBinaryCommand(command);
       
       // Set timeout
       Timer timeout = Timer(const Duration(seconds: 10), () {
-        if (_pendingMkdirCompleter != null && !_pendingMkdirCompleter!.isCompleted) {
-          _pendingMkdirCompleter!.completeError('Timeout waiting for mkdir response');
-          _pendingMkdirCompleter = null;
+        if (!completer.isCompleted) {
+          completer.completeError('Timeout waiting for mkdir response');
+          if (identical(_pendingMkdirCompleter, completer)) {
+            _pendingMkdirCompleter = null;
+          }
         }
       });
       
       try {
-        final response = await _pendingMkdirCompleter!.future;
+        final response = await completer.future;
         timeout.cancel();
         
         final success = response['success'] ?? false;
@@ -4478,7 +4601,9 @@ class BleProvider extends ChangeNotifier {
         _log('error', 'Error waiting for mkdir response: $e');
         return false;
       } finally {
-        _pendingMkdirCompleter = null;
+        if (identical(_pendingMkdirCompleter, completer)) {
+          _pendingMkdirCompleter = null;
+        }
       }
     } catch (e) {
       _log('error', 'Error creating directory: $e');
@@ -4504,7 +4629,9 @@ class BleProvider extends ChangeNotifier {
     _streamingDirectoryTreeBuffer.clear();
     _streamingTotalDirs = 0;
     
-    _pendingDirectoryTreeCompleter = Completer<Map<String, dynamic>>();
+    final completer = Completer<Map<String, dynamic>>();
+    _pendingDirectoryTreeCompleter = completer;
+    completer.future.ignore(); // Handle errors even while the write is pending.
     print('Created directory tree completer for pathType: $pathType');
     
     // Send directory tree request command
@@ -4515,14 +4642,16 @@ class BleProvider extends ChangeNotifier {
     
     // Set timeout
     Timer timeout = Timer(const Duration(seconds: 30), () {
-      if (_pendingDirectoryTreeCompleter != null && !_pendingDirectoryTreeCompleter!.isCompleted) {
-        _pendingDirectoryTreeCompleter!.completeError('Timeout waiting for directory tree');
-        _pendingDirectoryTreeCompleter = null;
+      if (!completer.isCompleted) {
+        completer.completeError('Timeout waiting for directory tree');
+        if (identical(_pendingDirectoryTreeCompleter, completer)) {
+          _pendingDirectoryTreeCompleter = null;
+        }
       }
     });
     
     try {
-      final response = await _pendingDirectoryTreeCompleter!.future;
+      final response = await completer.future;
       timeout.cancel();
       
       print('Received directory tree response: $response');
@@ -4557,7 +4686,9 @@ class BleProvider extends ChangeNotifier {
       _log('error', 'Error getting directory tree: $e');
       rethrow;
     } finally {
-      _pendingDirectoryTreeCompleter = null;
+      if (identical(_pendingDirectoryTreeCompleter, completer)) {
+        _pendingDirectoryTreeCompleter = null;
+      }
     }
   }
 
@@ -4715,14 +4846,19 @@ class BleProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _logCallback = null;
+    _notificationCallback = null;
+    _otaRebootPending = false;
     // Cancel all BLE stream subscriptions
     _adapterStateSubscription?.cancel();
     _scanResultsSubscription?.cancel();
     _connectionStateSubscription?.cancel();
     _rxValueSubscription?.cancel();
     _otaReconnectTimer?.cancel();
-    disconnect();
+    _commandTimeout?.cancel();
+    _fileListTimeout?.cancel();
+    unawaited(disconnect().catchError((Object _) {}));
     super.dispose();
   }
 }
-

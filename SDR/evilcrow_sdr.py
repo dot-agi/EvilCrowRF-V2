@@ -55,6 +55,7 @@ import time
 import threading
 import queue
 from typing import Optional, List, Tuple
+from serial_utils import open_serial
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,8 @@ class EvilCrowSDR:
         'ASK/OOK': 2, '4FSK': 3, 'MSK': 4,
     }
 
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 2.0):
+    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 2.0,
+                 auto_enable: bool = True):
         """
         Open serial connection to EvilCrow RF v2.
 
@@ -135,14 +137,17 @@ class EvilCrowSDR:
             port: Serial port name (e.g. 'COM8' or '/dev/ttyUSB0').
             baudrate: Baud rate (must match firmware: 115200).
             timeout: Read timeout in seconds.
+            auto_enable: Enable SDR mode; False allows read-only diagnostics.
         """
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self._manage_sdr = auto_enable
         self.ser: Optional[serial.Serial] = None
         self._streaming = False
         self._stream_thread: Optional[threading.Thread] = None
         self._rx_queue: queue.Queue = queue.Queue(maxsize=50000)
+        self._rx_remainder = bytearray()
 
         # Current state (updated after successful commands)
         self.frequency_hz: float = 433.92e6
@@ -154,36 +159,28 @@ class EvilCrowSDR:
 
     def _connect(self):
         """Open serial port, auto-enable SDR mode, and verify device."""
-        self.ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=self.timeout,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-        )
-        # Wait for device to be ready after USB enumeration
-        time.sleep(1.5)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
-
-        # Auto-enable SDR mode via serial (no app/phone needed)
-        print(f'[...] Enabling SDR mode on {self.port}...')
-        enable_resp = self.send_command('sdr_enable')
-        if 'SUCCESS' in enable_resp.upper():
+        self.ser, self.boot_log = open_serial(self.port, self.baudrate, 0.05)
+        try:
+            resp = self.send_command('board_id_read')
+            if 'Board ID: EvilCrow_RF_v2_SDR' not in resp or 'HACKRF_ERROR' in resp:
+                raise ConnectionError(
+                    f'Device on {self.port} did not identify as EvilCrow SDR.\n'
+                    f'Response: {resp}')
+            if self._manage_sdr:
+                print(f'[...] Enabling SDR mode on {self.port}...')
+                enable_resp = self.send_command('sdr_enable')
+                if 'HACKRF_SUCCESS' not in enable_resp or 'HACKRF_ERROR' in enable_resp:
+                    raise ConnectionError(
+                        f'Cannot enable SDR mode: {enable_resp or "no response"}. '
+                        'If identity works but enable hangs, see docs/macos.md '
+                        'for the firmware SPI-lock fix.')
+        except BaseException:
+            self.ser.close()
+            raise
+        if 'SD card not mounted' in self.boot_log:
+            print('[WARN] SD card not mounted; firmware is using internal LittleFS.')
+        if self._manage_sdr:
             print('[OK] SDR mode enabled via serial')
-        else:
-            print(f'[WARN] sdr_enable response: {enable_resp}')
-            print('       Trying board_id_read anyway...')
-
-        # Verify connection
-        resp = self.send_command('board_id_read')
-        if 'HACKRF' not in resp.upper():
-            raise ConnectionError(
-                f'Device on {self.port} did not respond as EvilCrow SDR.\n'
-                f'Response: {resp}\n'
-                'Firmware may need updating (sdr_enable serial command).'
-            )
         print(f'[OK] Connected to EvilCrow SDR on {self.port}')
 
     def send_command(self, command: str) -> str:
@@ -198,24 +195,56 @@ class EvilCrowSDR:
         """
         if not self.ser or not self.ser.is_open:
             raise RuntimeError('Serial port not open')
+        if self._streaming or (self._stream_thread and self._stream_thread.is_alive()):
+            raise RuntimeError('Stop RX before sending text commands')
 
+        deadline = time.monotonic() + self.timeout
         self.ser.write((command + '\n').encode('ascii'))
-        self.ser.flush()
+        # write_timeout bounds submission; the reply confirms delivery. POSIX
+        # flush() calls tcdrain(), which has no timeout and can stall forever.
 
         lines: List[str] = []
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        pending_line = bytearray()
+        last_data = time.monotonic()
+        acknowledged = False
+        scan_command = command.split(' ', 1)[0].lower() == 'spectrum_scan'
+        scan_complete = False
+        failed = False
+        while time.monotonic() < deadline:
             if self.ser.in_waiting > 0:
-                raw = self.ser.readline()
-                line = raw.decode('ascii', errors='replace').strip()
+                # readline() only times out between bytes: a continuous binary
+                # stream without LF can outlive the command deadline. Read one
+                # byte so the deadline also bounds that case, and so rx_start
+                # leaves every byte after its trailer for the RX worker.
+                raw = self.ser.read(1)
+                if not raw:
+                    continue
+                last_data = time.monotonic()
+                if raw != b'\n':
+                    pending_line.extend(raw)
+                    continue
+                line = pending_line.decode('ascii', errors='replace').strip()
+                pending_line.clear()
                 if line:
                     lines.append(line)
-                # Stop reading after success/error marker
-                if 'SUCCESS' in line or 'ERROR' in line:
+                acknowledged |= line in ('HACKRF_SUCCESS', 'HACKRF_ERROR')
+                failed |= line == 'HACKRF_ERROR'
+                if scan_command and line.startswith('Scan complete:'):
+                    scan_complete = True
+                    break
+                # The ACK precedes the body. For RX, stop at the trailer so
+                # subsequent binary bytes stay available to the RX worker.
+                if command == 'rx_start' and line == 'RX streaming started':
                     break
             else:
-                time.sleep(0.01)
+                if acknowledged and (not scan_command or failed) and time.monotonic() - last_data >= 0.15:
+                    break
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
+        if pending_line:
+            lines.append(pending_line.decode('ascii', errors='replace').strip())
+        if scan_command and not (scan_complete or failed):
+            raise TimeoutError('Spectrum scan did not finish before the command deadline')
         return '\n'.join(lines)
 
     # ── Configuration commands ─────────────────────────────────
@@ -351,6 +380,9 @@ class EvilCrowSDR:
         resp = self.send_command(
             f'spectrum_scan {start_mhz:.2f} {end_mhz:.2f} {step_khz:.0f}')
 
+        if 'HACKRF_ERROR' in resp:
+            raise RuntimeError(f'Spectrum scan was rejected: {resp}')
+
         # Parse spectrum output — firmware prints per-frequency RSSI
         # after "Scanning..." and before "Scan complete"
         results: List[Tuple[float, int]] = []
@@ -375,6 +407,15 @@ class EvilCrowSDR:
         Demodulated bytes from the CC1101 FIFO are sent via serial.
         Read them with read_raw() or read_raw_continuous().
         """
+        if self._streaming:
+            return True
+        # A fresh capture must not return unread data from an earlier session.
+        self._rx_remainder.clear()
+        while True:
+            try:
+                self._rx_queue.get_nowait()
+            except queue.Empty:
+                break
         resp = self.send_command('rx_start')
         if 'SUCCESS' in resp:
             self._streaming = True
@@ -390,7 +431,17 @@ class EvilCrowSDR:
         """Stop raw RX streaming."""
         self._streaming = False
         if self._stream_thread:
+            # Wake a blocked driver read without closing its port beneath the
+            # worker. The command reader starts only after that worker exits.
+            cancel_read = getattr(self.ser, 'cancel_read', None)
+            if self._stream_thread.is_alive() and cancel_read:
+                try:
+                    cancel_read()
+                except (OSError, serial.SerialException):
+                    pass  # The bounded join still checks worker ownership.
             self._stream_thread.join(timeout=2.0)
+            if self._stream_thread.is_alive():
+                raise RuntimeError('RX worker did not stop; refusing a second serial reader')
             self._stream_thread = None
         resp = self.send_command('rx_stop')
         if 'SUCCESS' in resp:
@@ -409,7 +460,8 @@ class EvilCrowSDR:
         Returns:
             Bytes received from CC1101 FIFO.
         """
-        result = bytearray()
+        result = bytearray(self._rx_remainder)
+        self._rx_remainder.clear()
         deadline = time.time() + timeout
         while len(result) < count and time.time() < deadline:
             try:
@@ -417,6 +469,8 @@ class EvilCrowSDR:
                 result.extend(chunk)
             except queue.Empty:
                 continue
+        # A serial packet can be larger than the caller's requested read.
+        self._rx_remainder.extend(result[count:])
         return bytes(result[:count])
 
     def _rx_worker(self):
@@ -452,17 +506,33 @@ class EvilCrowSDR:
         )
 
     def close(self):
-        """Close serial connection and disable SDR mode."""
-        if self._streaming:
-            self.stop_rx()
-        if self.ser and self.ser.is_open:
-            # Disable SDR mode on disconnect so device returns to normal
+        """Stop the serial reader, disable SDR, and report shutdown failures."""
+        if not self.ser or not self.ser.is_open:
+            return
+        failure = None
+        if self._streaming or self._stream_thread:
             try:
-                self.send_command('sdr_disable')
-            except Exception:
-                pass
+                if not self.stop_rx():
+                    raise RuntimeError('RX stop was not acknowledged; restart the device')
+            except Exception as error:
+                # Sending another command or closing the port while the worker
+                # still owns reads would race it. Keep ownership and report it.
+                if self._stream_thread and self._stream_thread.is_alive():
+                    raise
+                failure = error
+        try:
+            if self._manage_sdr and not self.disable_sdr():
+                raise RuntimeError('SDR disable was not acknowledged; restart the device')
+        except Exception as error:
+            if failure is None:
+                failure = error
+            else:
+                log.warning('SDR disable also failed: %s', error)
+        finally:
             self.ser.close()
-            print('[OK] Disconnected (SDR mode disabled)')
+        if failure is not None:
+            raise failure
+        print('[OK] Disconnected')
 
     def __enter__(self):
         return self

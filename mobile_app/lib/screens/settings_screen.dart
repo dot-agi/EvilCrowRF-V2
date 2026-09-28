@@ -17,6 +17,7 @@ import '../theme/app_colors.dart';
 import 'debug_screen.dart';
 import 'files_screen.dart';
 import 'ota_screen.dart';
+import 'usb_tools_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -276,6 +277,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                   ),
                 ),
+                if (Platform.isMacOS)
+                  TextButton.icon(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(builder: (_) => const UsbToolsScreen()),
+                    ),
+                    icon: const Icon(Icons.usb),
+                    label: const Text('USB Tools'),
+                  ),
                 // App Update check button
                 IconButton(
                   icon: const Icon(Icons.system_update_alt,
@@ -2325,6 +2334,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       // Button 1
                       _buildButtonConfig(
                         label: AppLocalizations.of(context)!.button1Gpio34,
+                        enabled: bleProvider.isConnected,
                         action: settingsProvider.button1Action,
                         color: AppColors.primaryAccent,
                         replayPath: settingsProvider.button1ReplayPath,
@@ -2343,6 +2353,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       // Button 2
                       _buildButtonConfig(
                         label: AppLocalizations.of(context)!.button2Gpio35,
+                        enabled: bleProvider.isConnected,
                         action: settingsProvider.button2Action,
                         color: AppColors.warning,
                         replayPath: settingsProvider.button2ReplayPath,
@@ -2368,6 +2379,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Widget _buildButtonConfig({
     required String label,
+    required bool enabled,
     required HwButtonAction action,
     required Color color,
     required String? replayPath,
@@ -2401,36 +2413,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
           runSpacing: 6,
           children: HwButtonAction.values.map((a) {
             final isSelected = action == a;
-            return GestureDetector(
-              onTap: () => onChanged(a),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                decoration: BoxDecoration(
-                  color: isSelected ? color.withValues(alpha: 0.2) : Colors.transparent,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: isSelected ? color : AppColors.borderDefault,
-                    width: isSelected ? 1.5 : 1,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(a.icon,
-                        size: 14,
-                        color: isSelected ? color : AppColors.secondaryText),
-                    const SizedBox(width: 4),
-                    Text(
-                      a.label,
-                      style: TextStyle(
-                        color: isSelected ? color : AppColors.secondaryText,
-                        fontSize: 11,
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+            final supported = a != HwButtonAction.toggleRecording;
+            return ChoiceChip(
+              selected: isSelected,
+              onSelected: enabled && supported ? (_) => onChanged(a) : null,
+              tooltip: supported ? null : 'Recording shortcut is not implemented in this firmware',
+              avatar: Icon(a.icon, size: 14,
+                  color: isSelected ? color : AppColors.secondaryText),
+              label: Text(a.label, style: TextStyle(
+                color: isSelected ? color : AppColors.secondaryText,
+                fontSize: 11,
+              )),
+              showCheckmark: false,
+              selectedColor: color.withValues(alpha: 0.2),
+              backgroundColor: Colors.transparent,
+              side: BorderSide(color: isSelected ? color : AppColors.borderDefault),
+              visualDensity: VisualDensity.compact,
             );
           }).toList(),
         ),
@@ -2450,7 +2448,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
-                onPressed: onPickReplayFile,
+                onPressed: enabled ? onPickReplayFile : null,
                 icon: const Icon(Icons.folder_open, size: 16),
                 label: const Text('Select .sub'),
               ),
@@ -2491,6 +2489,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _sendButtonConfig(BuildContext context, BleProvider bleProvider,
       SettingsProvider settingsProvider) async {
     try {
+      if (!bleProvider.isConnected) {
+        throw StateError('Connect to the device before changing button mappings');
+      }
       final cmd1 = FirmwareBinaryProtocol.createHwButtonConfigCommand(
       1,
       settingsProvider.button1Action.index,

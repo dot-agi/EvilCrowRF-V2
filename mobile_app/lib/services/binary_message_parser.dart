@@ -607,6 +607,7 @@ class BinaryModeSwitch {
       case 3: return 'Transmitting';
       case 4: return 'Analyzing';
       case 5: return 'Jamming';
+      case 6: return 'ProtoPirate';
       default: return 'Unknown';
     }
   }
@@ -688,6 +689,7 @@ class BinaryStatus {
       case 3: return 'Transmitting';
       case 4: return 'Analyzing';
       case 5: return 'Jamming';
+      case 6: return 'ProtoPirate';
       default: return 'Unknown';
     }
   }

@@ -60,9 +60,13 @@ See `docs/` for detailed guides, attack-method documentation, and developer note
 
 ## Quick Start
 
+For the macOS controller with Bluetooth and integrated USB tools, firmware compatibility,
+and SD-card troubleshooting,
+see [the macOS guide](docs/macos.md).
+
   
 
-Requirements: PlatformIO / PIOArduino (for firmware), Flutter (for mobile app), Python 3.8+ (for SDR tools).
+Requirements: PlatformIO / PIOArduino (for firmware), Flutter (for mobile app), Python 3.10+ (for SDR tools).
 
   
 

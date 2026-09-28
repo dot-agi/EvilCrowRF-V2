@@ -2849,7 +2849,7 @@ abstract class AppLocalizations {
   /// No description provided for @hwButtonsDesc.
   ///
   /// In en, this message translates to:
-  /// **'Assign an action to each physical button on the device. Press \"Send to Device\" to apply.'**
+  /// **'Choose an action for Button 1 or Button 2 while connected. Changes are sent immediately and saved on the device. RESET always restarts the chip and cannot be remapped.'**
   String get hwButtonsDesc;
 
   /// No description provided for @button1Gpio34.

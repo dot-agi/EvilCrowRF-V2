@@ -2,13 +2,17 @@
 
 Mobile application to control the Evil Crow RF v2 device via Bluetooth Low Energy (BLE).
 
+The macOS desktop app combines the Bluetooth controller with **Settings → USB
+Tools** for wired capture, recovery backups and firmware installation. See
+[the macOS guide](macos/README.md) for the complete build and usage workflow.
+
 ## Features
 
 - **Device discovery**: Automatically search for the ESP32 device named "EvilCrow_RF2"
 - **BLE connection**: Connect to the device with automatic service discovery
 - **Send commands**: Text input and quick buttons for common commands
 - **Connection status**: Shows current BLE connection state
-- **Cross-platform**: Works on Android and iOS
+- **Cross-platform**: Works on Android, iOS, and macOS
 
 ## Install Flutter
 
@@ -154,4 +158,3 @@ The app requests:
 ## License
 
 This project is provided "as-is" for educational purposes.
-

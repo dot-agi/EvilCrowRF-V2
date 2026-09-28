@@ -22,6 +22,10 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
   int _viewMode = 1;
   bool _isScanning = false;
   int _selectedModule = 0; // 0 or 1 (displayed as 1 or 2)
+  BleProvider? _bleProvider;
+  bool _disposed = false;
+  int _scanGeneration = 0;
+  Future<void> _commands = Future<void>.value();
 
   // List mode parameters
   double _rssiThreshold = 80.0; // RSSI threshold (0-100, default -80 dBm)
@@ -57,10 +61,31 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
   }
 
   @override
-  void dispose() {
-    // Stop scanning on the firmware when leaving this screen
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final provider = Provider.of<BleProvider>(context, listen: false);
+    if (identical(provider, _bleProvider)) return;
+    final previous = _bleProvider;
+    previous?.removeListener(_onConnectionChanged);
     if (_isScanning) {
-      _stopScanning();
+      final modules = _selectedModules;
+      _resetScanning();
+      if (previous != null) _stopWithoutUi(previous, modules);
+    }
+    _bleProvider = provider;
+    provider.addListener(_onConnectionChanged);
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _scanGeneration++;
+    final provider = _bleProvider;
+    provider?.removeListener(_onConnectionChanged);
+    // Cleanup uses captured values, never this screen's deactivated context.
+    if (_isScanning) {
+      _isScanning = false;
+      if (provider != null) _stopWithoutUi(provider, _selectedModules);
     }
     _decayTimer?.cancel();
     _spectrumAnimationController.dispose();
@@ -69,90 +94,116 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
 
   // ── Scanning control ──────────────────────────────────────────────
 
-  Future<void> _startScanning() async {
-    if (_isScanning) return;
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
+  List<int> get _selectedModules =>
+      _selectedModule == -1 ? const [0, 1] : [_selectedModule];
 
-    setState(() => _isScanning = true);
-    if (_viewMode != 0) _spectrumAnimationController.repeat();
+  // A stop must follow an in-flight scan write; a late write must not restart RX.
+  Future<void> _enqueueCommand(Future<void> Function() command) {
+    final result = _commands.then((_) => command());
+    _commands = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return result;
+  }
 
-    // Start decay timer for dynamic spectrogram
-    _startDecayTimer();
+  bool _scanIsCurrent(int generation) =>
+      !_disposed && mounted && _isScanning && generation == _scanGeneration;
 
-    try {
-      final int rssiThresholdInt = -_rssiThreshold.toInt();
-      if (_selectedModule == -1) {
-        // Both modules: send scan command to module 0 and module 1
-        final cmd0 = FirmwareBinaryProtocol.createRequestScanCommand(rssiThresholdInt, 0);
-        final cmd1 = FirmwareBinaryProtocol.createRequestScanCommand(rssiThresholdInt, 1);
-        await bleProvider.sendBinaryCommand(cmd0);
-        await bleProvider.sendBinaryCommand(cmd1);
-      } else {
-        final command = FirmwareBinaryProtocol.createRequestScanCommand(
-            rssiThresholdInt, _selectedModule);
-        await bleProvider.sendBinaryCommand(command);
+  void _resetScanning() {
+    _scanGeneration++;
+    _isScanning = false;
+    _spectrumAnimationController.stop();
+    _decayTimer?.cancel();
+  }
+
+  void _onConnectionChanged() {
+    if (_disposed || !mounted || !_isScanning ||
+        _bleProvider?.isConnected == true) return;
+    setState(_resetScanning);
+  }
+
+  Future<void> _sendIdle(BleProvider provider, List<int> modules) async {
+    Object? firstError;
+    for (final module in modules) {
+      if (!provider.isConnected) return;
+      try {
+        await provider.sendBinaryCommand(
+            FirmwareBinaryProtocol.createRequestIdleCommand(module));
+      } catch (error) {
+        firstError ??= error;
       }
-    } catch (e) {
-      setState(() => _isScanning = false);
-      _spectrumAnimationController.stop();
-      _decayTimer?.cancel();
-      if (mounted) {
-        Provider.of<NotificationProvider>(context, listen: false)
-            .showError(AppLocalizations.of(context)!.errorStartingScan('$e'));
+    }
+    if (firstError != null) throw firstError;
+    // A status packet captured before the final stop can arrive after an Idle
+    // notification. Refresh both radios once the queued stop writes finish.
+    for (var attempt = 0; attempt < 3; attempt++) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      if (!provider.isConnected) return;
+      try {
+        await provider.sendGetStateCommand().timeout(const Duration(seconds: 2));
+        if (modules.every((module) => provider.getModuleStatus(module) == 'Idle')) {
+          return;
+        }
+      } catch (_) {
+        return; // A refresh is best effort; the stop write was already sent.
       }
     }
   }
 
-  Future<void> _stopScanning() async {
-    if (!_isScanning) return;
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
+  void _stopWithoutUi(BleProvider provider, List<int> modules) {
+    unawaited(_enqueueCommand(() => _sendIdle(provider, modules))
+        .catchError((Object _) {}));
+  }
 
-    setState(() => _isScanning = false);
-    _spectrumAnimationController.stop();
-    _decayTimer?.cancel();
-
+  Future<void> _sendScan() async {
+    final provider = _bleProvider;
+    if (provider == null || !provider.isConnected || !_isScanning) return;
+    final generation = _scanGeneration;
+    final modules = _selectedModules;
+    final threshold = -_rssiThreshold.toInt();
     try {
-      if (_selectedModule == -1) {
-        // Stop both modules
-        final cmd0 = FirmwareBinaryProtocol.createRequestIdleCommand(0);
-        final cmd1 = FirmwareBinaryProtocol.createRequestIdleCommand(1);
-        await bleProvider.sendBinaryCommand(cmd0);
-        await bleProvider.sendBinaryCommand(cmd1);
-      } else {
-        final command = FirmwareBinaryProtocol.createRequestIdleCommand(
-            _selectedModule);
-        await bleProvider.sendBinaryCommand(command);
-      }
-    } catch (e) {
-      if (mounted) {
+      await _enqueueCommand(() async {
+        for (final module in modules) {
+          if (!_scanIsCurrent(generation) || !provider.isConnected) return;
+          await provider.sendBinaryCommand(
+              FirmwareBinaryProtocol.createRequestScanCommand(threshold, module));
+        }
+      });
+    } catch (error) {
+      if (!_scanIsCurrent(generation)) return;
+      setState(_resetScanning);
+      _stopWithoutUi(provider, modules);
+      Provider.of<NotificationProvider>(context, listen: false)
+          .showError(AppLocalizations.of(context)!.errorStartingScan('$error'));
+    }
+  }
+
+  Future<void> _startScanning() async {
+    if (_disposed || _isScanning || _bleProvider?.isConnected != true) return;
+    _scanGeneration++;
+    setState(() => _isScanning = true);
+    if (_viewMode != 0) _spectrumAnimationController.repeat();
+    _startDecayTimer();
+    await _sendScan();
+  }
+
+  Future<void> _stopScanning() async {
+    if (_disposed || !_isScanning) return;
+    final provider = _bleProvider;
+    final modules = _selectedModules;
+    setState(_resetScanning);
+    final generation = _scanGeneration;
+    if (provider == null) return;
+    try {
+      await _enqueueCommand(() => _sendIdle(provider, modules));
+    } catch (error) {
+      if (!_disposed && mounted && generation == _scanGeneration) {
         Provider.of<NotificationProvider>(context, listen: false)
-            .showError(AppLocalizations.of(context)!.errorStoppingScan('$e'));
+            .showError(AppLocalizations.of(context)!.errorStoppingScan('$error'));
       }
     }
   }
 
   void _clearSignals() {
-    Provider.of<BleProvider>(context, listen: false)
-        .updateDetectedSignals([]);
-  }
-
-  /// Re-send scan command with updated RSSI threshold while scanning
-  Future<void> _restartScanningWithNewRssi() async {
-    if (!_isScanning) return;
-    final bleProvider = Provider.of<BleProvider>(context, listen: false);
-    try {
-      final int rssiThresholdInt = -_rssiThreshold.toInt();
-      if (_selectedModule == -1) {
-        final cmd0 = FirmwareBinaryProtocol.createRequestScanCommand(rssiThresholdInt, 0);
-        final cmd1 = FirmwareBinaryProtocol.createRequestScanCommand(rssiThresholdInt, 1);
-        await bleProvider.sendBinaryCommand(cmd0);
-        await bleProvider.sendBinaryCommand(cmd1);
-      } else {
-        final command = FirmwareBinaryProtocol.createRequestScanCommand(
-            rssiThresholdInt, _selectedModule);
-        await bleProvider.sendBinaryCommand(command);
-      }
-    } catch (_) {}
+    _bleProvider?.updateDetectedSignals([]);
   }
 
   // ── Build spectrum data from detected signals ─────────────────────
@@ -181,8 +232,7 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
     _decayTimer = Timer.periodic(const Duration(milliseconds: 150), (_) {
       if (!mounted || !_isScanning) return;
 
-      final bleProvider = Provider.of<BleProvider>(context, listen: false);
-      final signals = bleProvider.detectedSignals;
+      final signals = _bleProvider?.detectedSignals ?? <DetectedSignal>[];
 
       // Build fresh snapshot from recent signals (last 3 seconds)
       final now = DateTime.now();
@@ -247,8 +297,9 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
                         _isScanning ? Icons.stop : Icons.play_arrow,
                         color: _isScanning ? AppColors.error : AppColors.success,
                       ),
-                      onPressed: _isScanning ? _stopScanning : _startScanning,
-                      tooltip: _isScanning ? AppLocalizations.of(context)!.stop : AppLocalizations.of(context)!.start,
+                      onPressed: !bleProvider.isConnected ? null
+                          : (_isScanning ? _stopScanning : _startScanning),
+                      tooltip: '${_isScanning ? AppLocalizations.of(context)!.stop : AppLocalizations.of(context)!.start} ${AppLocalizations.of(context)!.scanner}',
                     ),
                   ],
                 ),
@@ -329,7 +380,7 @@ class _SignalScannerScreenState extends State<SignalScannerScreen>
                       setState(() => _rssiThreshold = v);
                       // Re-send scan command with new RSSI threshold in real-time
                       if (_isScanning) {
-                        _restartScanningWithNewRssi();
+                        _sendScan();
                       }
                     },
                   ),
