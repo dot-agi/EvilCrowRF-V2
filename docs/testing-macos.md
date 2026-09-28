@@ -33,7 +33,9 @@ The device used for these live tests ran separately built **1.1.4** firmware,
 | Flutter packaged GNU capture/export | Captured 2,376 synthetic complex samples and exported 19,008 bytes in complex64 format | GNU Radio runtime was not used |
 | Flutter packaged URH bridge | Local TCP client received 2,374 bytes / 1,187 samples excluding padding; fragmented retuning command and Stop passed | External URH desktop UI was not used |
 | Flutter GUI backup/export | Full 4 MiB read and device-MD5 verification passed; exported SHA-256 sidecar names and matches the saved image | Two serial-read retries recovered |
-| Flutter GUI firmware installation | Final independent package imported the exported backup, previewed the selected image, wrote 1,205,888 bytes to app0 at `0x10000`, verified its hash and restarted | Post-update USB/BLE/SD checks are pending |
+| Flutter GUI firmware installation | Final independent package imported the exported backup, previewed the selected image, wrote 1,205,888 bytes to app0 at `0x10000`, verified its hash and restarted | Application partition only |
+| Post-update USB receive | Captured 2,406 bytes in five seconds; stop acknowledged; final state inactive and not streaming | Demodulated data may be noise |
+| Post-update BLE and SD | Connected after a fresh scan, reported firmware 1.1.4, and listed the SD `DATA` folders | Cold remembered-device connection is being rechecked after an initialization fix |
 | Flutter critical-operation Quit guard | Cmd-Q displayed Keep Open during the active backup; backup continued to completion | Normal application quit, not forced process termination |
 | Flutter GUI backup preflight | Rejected unreadable flash IDs `0xffffff` and `0x000000`; no flash write occurred | A full power cycle was needed before the successful backup |
 | Button mapping persistence | Mapping survived restart; original mappings restored | No physical button press tested |
@@ -83,14 +85,17 @@ GNU Radio runtime flowgraph has been exercised against the device.
 
 ## Flutter tests and native device suite
 
-The Flutter macOS app has **24 passing host tests**: seven scanner
+The Flutter macOS app has **28 passing host tests**: seven scanner
 tests, five nRF lifecycle tests, three radio-mode parser tests, one BLE-provider
-teardown test, six USB service tests, and two backup-file tests.
+teardown test, four Bluetooth-readiness tests, six USB service tests, and two
+backup-file tests.
 They cover manual start/stop, navigation during pending writes, disconnects,
 partial startup failure, bounded state refresh, teardown, and ProtoPirate mode
 reporting. USB cases cover startup exclusivity, queued Stop, fragmented JSON,
 stream draining, process failures, disposal, and quit protection. Backup cases
 verify the exported filename/checksum pair and reject changed image contents.
+Bluetooth cases cover a delayed powered-on state, repeated Connect clicks,
+permission denial, powered-off state, and a ten-second initialization timeout.
 These tests use fake BLE/process objects and local temporary files.
 
 The native macOS integration suite passed in 39 seconds with the real Flutter
@@ -125,11 +130,16 @@ the native folder picker and selected the 1,205,888-byte firmware image whose
 SHA-256 is recorded above. The confirmation showed that exact hash and app0 at
 `0x10000`. The write transferred 683,460 compressed bytes in 67.1 seconds,
 verified the device hash, restarted the board, and returned `ok: true`.
-Post-update USB receive, Bluetooth reconnect and SD checks remain pending.
+After the update, a five-second USB receive captured 2,406 bytes, acknowledged
+Stop, and reported inactive/non-streaming status. Bluetooth reconnected after a
+fresh scan, reported firmware 1.1.4, and listed the SD `DATA` folders. A cold
+remembered-device connection exposed CoreBluetooth's initial unknown state;
+the app now waits for a resolved adapter state before connecting. The cold
+connection is being rechecked in the rebuilt package.
 
 The app release was rebuilt directly from `main` plus this app/host change set,
 without the firmware PR. The build generated its own USB helper and passed
-deep/strict code-signature verification. The 24 Flutter host tests also passed
+deep/strict code-signature verification. The 28 Flutter host tests also passed
 in this independent checkout; the icon still matches the canonical SDR artwork.
 
 This checkout supplies a synthetic Kia V0 RAW fixture. Feeding its
@@ -179,7 +189,7 @@ are reported and retained.
 | Known-signal capture and protocol decoding | An owned transmitter with known frequency, modulation, and payload |
 | Physical buttons | Press each user button and verify the selected action; test RESET separately |
 | URH / GNU Radio desktop integration | Run the external application or runtime flowgraph; local adapter transport has passed |
-| Post-update device checks | Smoke-test USB receive, Bluetooth reconnect and SD state after the verified GUI update |
+| Cold remembered-device connection | Recheck the rebuilt app without a preliminary device scan |
 | BLE OTA | Complete transfer, validation, reboot, and version check with a fresh backup |
 | Replay, emulation, brute-force, nRF HID/string/Ducky, jamming | Scoped owned receiver and isolated RF setup appropriate to the operation |
 | Factory reset and SD format | Explicit destructive test with a verified backup and restoration plan |

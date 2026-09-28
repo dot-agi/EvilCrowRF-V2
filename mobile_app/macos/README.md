@@ -53,6 +53,10 @@ Security → Bluetooth**, then reopen the app. CoreBluetooth manages the system
 permission prompt and negotiated MTU; Android permission checks are skipped
 on macOS and iOS.
 
+On later launches, **Connect** can use the remembered device without scanning.
+It waits up to ten seconds for Bluetooth initialization. Permission denial and
+powered-off Bluetooth show separate messages.
+
 The **Home** RF scanner starts idle. Select **M1**, **M2**, or **1+2**, then
 press **Start Scanner** at the top right. **Scanning stopped** is the normal
 idle label before the first scan. **Stop Scanner** stops reception. Leaving

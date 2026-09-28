@@ -23,6 +23,57 @@ import '../services/binary_message_parser.dart';
 
 class BleProvider extends ChangeNotifier {
   bool _disposed = false;
+  bool _isConnecting = false;
+
+  @protected
+  Stream<BluetoothAdapterState> get adapterStates => FlutterBluePlus.adapterState;
+
+  String _adapterMessage(BluetoothAdapterState state) {
+    switch (state) {
+      case BluetoothAdapterState.on:
+        return '';
+      case BluetoothAdapterState.unknown:
+      case BluetoothAdapterState.turningOn:
+        return 'Bluetooth initializing...';
+      case BluetoothAdapterState.unauthorized:
+        return 'Bluetooth permission denied. Allow Bluetooth access in system settings.';
+      case BluetoothAdapterState.unavailable:
+        return 'Bluetooth is unavailable';
+      case BluetoothAdapterState.turningOff:
+        return 'Bluetooth is turning off';
+      case BluetoothAdapterState.off:
+        return 'Bluetooth disabled';
+    }
+  }
+
+  Future<void> _waitForBluetooth() async {
+    final ready = Completer<BluetoothAdapterState>();
+    final subscription = adapterStates.listen((state) {
+      if (state != BluetoothAdapterState.unknown &&
+          state != BluetoothAdapterState.turningOn && !ready.isCompleted) {
+        ready.complete(state);
+      }
+    }, onError: (Object error, StackTrace stack) {
+      if (!ready.isCompleted) ready.completeError(error, stack);
+    }, onDone: () {
+      if (!ready.isCompleted) {
+        ready.completeError(StateError('Bluetooth adapter state is unavailable'));
+      }
+    });
+    try {
+      final state = await ready.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw TimeoutException(
+            'Bluetooth initialization timed out. Try again or reopen the app.'),
+      );
+      if (_disposed) throw StateError('Bluetooth controller has closed');
+      if (state != BluetoothAdapterState.on) {
+        throw StateError(_adapterMessage(state));
+      }
+    } finally {
+      await subscription.cancel();
+    }
+  }
 
   @override
   void notifyListeners() {
@@ -306,12 +357,9 @@ class BleProvider extends ChangeNotifier {
     
     // Listen to Bluetooth state changes
     _adapterStateSubscription?.cancel();
-    _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
-      if (state == BluetoothAdapterState.on) {
-        // Don't show "Bluetooth enabled" message
-        statusMessage = '';
-      } else {
-        statusMessage = 'Bluetooth disabled';
+    _adapterStateSubscription = adapterStates.listen((state) {
+      statusMessage = _adapterMessage(state);
+      if (state != BluetoothAdapterState.on) {
         isConnected = false;
         connectedDevice = null;
       }
@@ -525,7 +573,12 @@ class BleProvider extends ChangeNotifier {
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
+    if (_isConnecting || _disposed) return;
+    _isConnecting = true;
     try {
+      // CoreBluetooth initially reports unknown while its manager starts.
+      // A cached device can be selected before the first resolved state.
+      await _waitForBluetooth();
       statusMessage = 'connecting'; // Key for localization
       _log('info', 'Attempting to connect to device', details: 'Device: ${device.name} (${device.id})');
       print('Connecting to device: ${device.name} (${device.id})');
@@ -654,6 +707,8 @@ class BleProvider extends ChangeNotifier {
     } catch (e) {
       statusMessage = 'Connection error: $e';
       notifyListeners();
+    } finally {
+      _isConnecting = false;
     }
   }
 
