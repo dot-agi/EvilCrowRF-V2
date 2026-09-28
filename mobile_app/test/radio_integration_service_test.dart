@@ -33,6 +33,16 @@ void main() {
     expect(await bundle.entry.readAsString(), '<project/>');
   });
 
+  test('exported launcher is executable before any application launch',
+      () async {
+    final bundle = await service.exportBundle(
+        staging: staging,
+        destination: Directory('${root.path}/saved'),
+        manifest: manifest);
+    expect((await bundle.launcher.stat()).mode & 0x1ff, 0x1ed); // 0755.
+    expect((await bundle.entry.stat()).mode & 0x49, 0); // No execute bits.
+  }, skip: !(Platform.isMacOS || Platform.isLinux));
+
   test('export preserves binary contents across multiple stream chunks',
       () async {
     final bytes = Uint8List.fromList(

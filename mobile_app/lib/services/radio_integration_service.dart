@@ -65,10 +65,19 @@ class RadioIntegrationService {
           await output.close();
         }
       }
+      final launcherFile = File('${destination.path}/$launcher');
+      if (Platform.isMacOS || Platform.isLinux) {
+        final permissions = await Process.run(
+            '/bin/chmod', ['755', launcherFile.absolute.path]);
+        if (permissions.exitCode != 0) {
+          throw FileSystemException(
+              'Could not make the exported launcher executable: '
+              '${permissions.stderr.toString().trim()}',
+              launcherFile.path);
+        }
+      }
       return RadioIntegrationBundle(
-          destination,
-          File('${destination.path}/$launcher'),
-          File('${destination.path}/$entry'));
+          destination, launcherFile, File('${destination.path}/$entry'));
     } catch (_) {
       await destination.delete(recursive: true);
       rethrow;
