@@ -41,6 +41,9 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   late TabController _tabController;
   bool _initializing = false;
   bool _initFailed = false;
+  BleProvider? _bleProvider;
+  bool _disposed = false;
+  Future<void> _commands = Future<void>.value();
 
   // Local UI state (not data)
   int _selectedTargetIndex = -1;
@@ -66,7 +69,14 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _bleProvider = Provider.of<BleProvider>(context, listen: false);
+  }
+
+  @override
   void dispose() {
+    _disposed = true;
     // Send NRF_STOP_ALL to firmware to cleanly release SPI bus
     // when user navigates away from NRF screen
     _cleanupNrf();
@@ -79,15 +89,31 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   /// Stop all NRF tasks when leaving this screen so CC1101 (SubGhz)
   /// operations can resume without SPI bus contention.
   void _cleanupNrf() {
-    try {
-      final bleProvider = Provider.of<BleProvider>(context, listen: false);
-      if (bleProvider.isConnected) {
-        final cmd = FirmwareBinaryProtocol.createNrfStopAllCommand();
-        bleProvider.sendBinaryCommand(cmd);
+    final provider = _bleProvider;
+    if (provider == null) return;
+    // Capture the provider before deactivation and stop after pending writes.
+    unawaited(_commands.then((_) async {
+      if (!provider.isConnected) return;
+      await provider.sendBinaryCommand(
+          FirmwareBinaryProtocol.createNrfStopAllCommand());
+    }).catchError((Object _) {}));
+  }
+
+  Future<void> _sendCommand(BleProvider provider, Uint8List command) {
+    final result = _commands.then((_) async {
+      if (_disposed || !provider.isConnected) return;
+      try {
+        await provider.sendBinaryCommand(command);
+      } catch (_) {
+        if (!_disposed) rethrow;
       }
-    } catch (_) {
-      // Ignore errors during dispose — widget tree may be torn down
-    }
+    });
+    _commands = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return result;
+  }
+
+  bool _isActive(BleProvider provider) {
+    return !_disposed && mounted && identical(provider, _bleProvider);
   }
 
   // ── NRF Initialization ──────────────────────────────────────
@@ -100,12 +126,15 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
 
     try {
       final cmd = FirmwareBinaryProtocol.createNrfInitCommand();
-      await bleProvider.sendBinaryCommand(cmd);
+      await _sendCommand(bleProvider, cmd);
+      if (!_isActive(bleProvider)) return;
       await Future.delayed(const Duration(milliseconds: 500));
+      if (!_isActive(bleProvider)) return;
       bleProvider.nrfInitialized = true;
       bleProvider.nrfNotify();
       setState(() => _initializing = false);
     } catch (e) {
+      if (!_isActive(bleProvider)) return;
       setState(() {
         _initializing = false;
         _initFailed = true;
@@ -118,7 +147,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _startScan() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfScanStartCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfScanning = true;
     bleProvider.nrfNotify();
   }
@@ -126,7 +156,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _stopScan() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfScanStopCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfScanning = false;
     bleProvider.nrfNotify();
   }
@@ -137,7 +168,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
     final cmd = FirmwareBinaryProtocol.createNrfAttackStringCommand(
       targetIndex, _stringController.text,
     );
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfAttacking = true;
     bleProvider.nrfNotify();
   }
@@ -148,7 +180,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
     final cmd = FirmwareBinaryProtocol.createNrfAttackDuckyCommand(
       targetIndex, _duckyPathController.text,
     );
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfAttacking = true;
     bleProvider.nrfNotify();
   }
@@ -156,7 +189,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _stopAttack() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfAttackStopCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfAttacking = false;
     bleProvider.nrfNotify();
   }
@@ -164,7 +198,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _requestScanStatus() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfScanStatusCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
   }
 
   // ── Spectrum Commands ───────────────────────────────────────
@@ -172,7 +207,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _startSpectrum() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfSpectrumStartCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfSpectrumRunning = true;
     bleProvider.nrfNotify();
   }
@@ -180,7 +216,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _stopSpectrum() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfSpectrumStopCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfSpectrumRunning = false;
     bleProvider.nrfSpectrumLevels = List.filled(126, 0);
     bleProvider.nrfNotify();
@@ -202,7 +239,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
     } else {
       cmd = FirmwareBinaryProtocol.createNrfJamStartCommand(_jamMode);
     }
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfJammerRunning = true;
     bleProvider.nrfNotify();
     // Read current dwell from cached config for the live slider
@@ -215,7 +253,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _stopJammer() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamStopCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     bleProvider.nrfJammerRunning = false;
     bleProvider.nrfNotify();
   }
@@ -225,13 +264,15 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
   Future<void> _setDwellTimeLive(int ms) async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamSetDwellCommand(ms);
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
   }
 
   Future<void> _requestModeConfig(int mode) async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamModeConfigGetCommand(mode);
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
   }
 
   Future<void> _setModeConfig(int mode, int pa, int dr, int dwell,
@@ -239,19 +280,22 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamModeConfigSetCommand(
         mode, pa, dr, dwell, flooding, bursts);
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
   }
 
   Future<void> _requestModeInfo(int mode) async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamModeInfoCommand(mode);
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
   }
 
   Future<void> _resetAllConfigs() async {
     final bleProvider = Provider.of<BleProvider>(context, listen: false);
     final cmd = FirmwareBinaryProtocol.createNrfJamResetConfigCommand();
-    await bleProvider.sendBinaryCommand(cmd);
+    await _sendCommand(bleProvider, cmd);
+    if (!_isActive(bleProvider)) return;
     // Clear local cache so it gets refreshed
     bleProvider.nrfJamModeConfigs.clear();
     bleProvider.nrfNotify();
@@ -959,7 +1003,8 @@ class _NrfScreenState extends State<NrfScreen> with SingleTickerProviderStateMix
         if (jammerRunning) {
           // Send live mode change command (0x2C) to firmware
           final cmd = FirmwareBinaryProtocol.createNrfJamSetModeCommand(modeData.mode);
-          await bleProvider.sendBinaryCommand(cmd);
+          await _sendCommand(bleProvider, cmd);
+          if (!_isActive(bleProvider)) return;
           // Update cached dwell for the live slider
           final cachedCfg = bleProvider.nrfJamModeConfigs[modeData.mode];
           setState(() {

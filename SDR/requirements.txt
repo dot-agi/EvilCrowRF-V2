@@ -1,6 +1,7 @@
 # Runtime dependencies
 pyserial>=3.5
 numpy>=1.21
+esptool>=5.4,<6
 
 # Build tools (auto-installed by build_exe.py if missing)
 pyinstaller>=6.0

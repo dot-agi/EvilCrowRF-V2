@@ -449,7 +449,7 @@ class ModuleStatusWidget extends StatelessWidget {
 
     if (!sdMounted) {
       iconColor = AppColors.disabledText;
-      statusText = 'Not Inserted';
+      statusText = 'Not mounted';
     } else {
       iconColor = AppColors.success;
       statusText = '${sdFreeMB} MB free / ${sdTotalMB} MB';

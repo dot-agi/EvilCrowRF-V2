@@ -52,26 +52,17 @@ import time
 import sys
 import argparse
 import select
+from serial_utils import detect_evilcrow_port
+from evilcrow_sdr import EvilCrowSDR
 
 log = logging.getLogger(__name__)
 
 
 def find_evilcrow_port() -> str:
-    """Auto-detect EvilCrow serial port (CP2102 / CH340 USB-UART)."""
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        desc = (p.description or '').lower()
-        vid = p.vid or 0
-        # Common USB-UART chips used with ESP32
-        if any(chip in desc for chip in ['cp210', 'ch340', 'ch9102', 'ftdi']):
-            return p.device
-        # Silicon Labs CP2102 (common on ESP32 devboards)
-        if vid == 0x10C4:
-            return p.device
-    # Fallback: return first port
-    if ports:
-        return ports[0].device
-    raise RuntimeError('No serial ports found. Is the device connected?')
+    port = detect_evilcrow_port()
+    if port:
+        return port
+    raise RuntimeError('Specify --port; a single USB UART could not be identified')
 
 
 class URHBridge:
@@ -84,6 +75,10 @@ class URHBridge:
         self.server: socket.socket = None
         self.client: socket.socket = None
         self.running = False
+        self.device = None
+        self._device_lock = threading.RLock()
+        self._rx_active = False
+        self._stop_requested = threading.Event()
 
     def log(self, msg: str):
         print(f'[{time.strftime("%H:%M:%S")}] {msg}')
@@ -92,54 +87,16 @@ class URHBridge:
         """Open serial connection to EvilCrow and enable SDR mode."""
         try:
             self.log(f'Connecting to {self.serial_port}...')
-            self.ser = serial.Serial(self.serial_port, 115200, timeout=0.1)
-            time.sleep(1.5)
-            self.ser.reset_input_buffer()
-
-            # Auto-enable SDR mode via serial (no app/phone needed)
-            self.log('Enabling SDR mode via serial...')
-            self.ser.write(b'sdr_enable\n')
-            time.sleep(0.5)
-            resp = b''
-            while self.ser.in_waiting:
-                resp += self.ser.read(self.ser.in_waiting)
-            resp_str = resp.decode('ascii', errors='replace')
-
-            if 'SUCCESS' in resp_str.upper():
-                self.log('SDR mode enabled.')
-            else:
-                self.log(f'sdr_enable response: {resp_str.strip()}')
-                self.log('Trying board_id_read anyway...')
-
-            # Verify device
-            self.ser.write(b'board_id_read\n')
-            time.sleep(0.3)
-            resp = b''
-            while self.ser.in_waiting:
-                resp += self.ser.read(self.ser.in_waiting)
-            resp_str = resp.decode('ascii', errors='replace')
-
-            if 'HACKRF' not in resp_str.upper():
-                self.log(f'Device did not respond as EvilCrow SDR.')
-                self.log(f'Response: {resp_str.strip()}')
-                self.log('Firmware may need updating (sdr_enable support).')
-                return False
-
-            self.log('Device connected and SDR mode verified.')
-
-            # Set initial config
-            self.ser.write(b'set_freq 433920000\n')
-            time.sleep(0.1)
-            self.ser.write(b'set_sample_rate 250000\n')
-            time.sleep(0.1)
-            self.ser.write(b'set_gain 15\n')
-            time.sleep(0.1)
-            # Drain responses
-            self.ser.reset_input_buffer()
-
+            self.device = EvilCrowSDR(self.serial_port)
+            self.ser = self.device.ser
+            if not (self.device.set_frequency(433.92e6) and
+                    self.device.set_modulation('ASK') and self.device.set_bandwidth(650) and
+                    self.device.set_data_rate(3793.72) and self.device.set_gain(15)):
+                raise RuntimeError('Initial receiver configuration failed')
             return True
         except Exception as e:
             self.log(f'Connection failed: {e}')
+            self.cleanup()
             return False
 
     def start_server(self) -> bool:
@@ -149,6 +106,7 @@ class URHBridge:
             self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server.bind(('127.0.0.1', self.tcp_port))
             self.server.listen(1)
+            self.server.settimeout(0.2)
             self.log(f'TCP server listening on 127.0.0.1:{self.tcp_port}')
             self.log('In URH: File > New > "RTL-TCP" source > localhost:{}'.format(
                 self.tcp_port))
@@ -159,87 +117,61 @@ class URHBridge:
 
     def handle_rtl_command(self, data: bytes):
         """Handle RTL-TCP 5-byte commands from URH."""
-        if len(data) < 5:
+        if len(data) != 5:
             return
         cmd = data[0]
         param = struct.unpack('>I', data[1:5])[0]
-
-        if cmd == 0x01:  # Set frequency
-            self.log(f'  Freq: {param} Hz ({param/1e6:.3f} MHz)')
-            self.ser.write(f'set_freq {param}\n'.encode())
-        elif cmd == 0x02:  # Set sample rate
-            self.log(f'  Rate: {param} Hz')
-            self.ser.write(f'set_sample_rate {param}\n'.encode())
-        elif cmd == 0x04:  # Set gain
-            gain = param // 10
-            self.log(f'  Gain: {gain} dB')
-            self.ser.write(f'set_gain {gain}\n'.encode())
-        elif cmd == 0x05:  # Set gain mode (auto/manual)
-            pass  # CC1101 always uses AGC
+        if cmd == 0x01:
+            operation = lambda: self.device.set_frequency(param)
+            label = f'frequency {param} Hz'
+        elif cmd == 0x02:
+            if not 600 <= param <= 500000:
+                self.log(f'Rejected RTL sample-rate request {param}: CC1101 demodulation '
+                         'supports 600–500000 Baud. IQ sample-clock settings do not apply.')
+                return
+            self.log(f'RTL sample-rate request sets CC1101 demodulation to {param} Baud.')
+            operation = lambda: self.device.set_data_rate(param)
+            label = f'data rate {param} Baud'
+        elif cmd == 0x04:
+            gain = int(struct.unpack('>i', data[1:5])[0] / 10)
+            operation = lambda: self.device.set_gain(gain)
+            label = f'gain {gain} dB'
+        elif cmd in (0x03, 0x08):  # RTL tuner gain mode / AGC mode
+            self.log('CC1101 uses automatic gain control.')
+            return
         else:
-            self.log(f'  Unknown RTL cmd: 0x{cmd:02X} param={param}')
+            self.log(f'Unsupported RTL command: 0x{cmd:02X} param={param}')
+            return
 
-    def stream_data(self):
-        """Read CC1101 FIFO data and stream to URH as 8-bit unsigned IQ."""
-        self.log('Starting RX and data stream...')
-        self.ser.write(b'rx_start\n')
-        time.sleep(0.2)
-        self.ser.reset_input_buffer()
-
-        sample_count = 0
-        last_log = time.time()
-
-        try:
-            while self.running and self.client:
-                # Read available serial data from CC1101 FIFO
-                avail = self.ser.in_waiting
-                if avail > 0:
-                    raw = self.ser.read(min(avail, 512))
-                    if raw:
-                        # Convert demodulated bytes to unsigned 8-bit IQ pairs.
-                        # The CC1101 outputs demodulated bytes, not true IQ.
-                        # We send each byte as both I and Q (mono signal).
-                        iq_buf = bytearray(len(raw) * 2)
-                        for i, b in enumerate(raw):
-                            iq_buf[i * 2] = b       # I channel
-                            iq_buf[i * 2 + 1] = 127  # Q channel (DC center)
-                        try:
-                            self.client.sendall(iq_buf)
-                            sample_count += len(raw)
-                        except (BrokenPipeError, OSError):
-                            self.log('Client disconnected during stream.')
-                            break
-                else:
-                    # No data available — send silence (center value) to keep
-                    # URH's sample rate clock ticking
-                    silence = bytes([127, 127]) * 64  # 64 silent samples
-                    try:
-                        self.client.sendall(silence)
-                    except (BrokenPipeError, OSError):
-                        break
-                    time.sleep(0.005)
-
-                # Log progress every 5 seconds
-                now = time.time()
-                if now - last_log >= 5.0:
-                    self.log(f'  Streamed {sample_count} samples')
-                    last_log = now
-
-        finally:
+        # Only the shared library reads UART. Pause RX before textual replies
+        # so configuration ACKs cannot be forwarded as demodulated samples.
+        with self._device_lock:
+            resume = self._rx_active
+            if resume:
+                self._stop_rx()
             try:
-                self.ser.write(b'rx_stop\n')
-                time.sleep(0.1)
-            except Exception:
-                pass
-            self.log(f'Stream stopped ({sample_count} total samples)')
+                if not operation():
+                    self.log(f'Receiver rejected {label}; keeping its previous setting.')
+            finally:
+                if resume and self.running and not self._stop_requested.is_set():
+                    if not self.device.start_rx():
+                        raise RuntimeError('Receiver did not acknowledge RX restart')
+                    self._rx_active = True
+
+    def _stop_rx(self):
+        if self._rx_active:
+            if not self.device.stop_rx():
+                raise RuntimeError('RX stop was not acknowledged; restart the device')
+            self._rx_active = False
 
     def handle_client(self, client: socket.socket, addr):
         """Handle a URH client connection."""
         self.client = client
         self.log(f'URH connected from {addr[0]}:{addr[1]}')
-
+        sample_count = 0
         try:
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client.settimeout(2.0)  # A stalled reader must not hold RX indefinitely.
 
             # Send RTL-TCP DongleInfo header (12 bytes)
             # Magic: "RTL0" | Tuner type: uint32 | Gain count: uint32
@@ -247,51 +179,73 @@ class URHBridge:
             client.sendall(header)
             self.log('Sent RTL-TCP header (12 bytes)')
 
-            time.sleep(0.1)
-
-            # Start streaming in background thread
-            self.running = True
-            stream_t = threading.Thread(target=self.stream_data, daemon=True)
-            stream_t.start()
-
-            # Handle commands from URH in main loop
-            while self.running:
-                try:
-                    ready, _, _ = select.select([client], [], [], 1.0)
-                    if ready:
-                        data = client.recv(1024)
-                        if not data:
-                            break
-                        # Process 5-byte RTL-TCP commands
-                        for i in range(0, len(data) - 4, 5):
-                            self.handle_rtl_command(data[i:i + 5])
-                    if not stream_t.is_alive():
+            with self._device_lock:
+                if self._stop_requested.is_set():
+                    return
+                if not self.device.start_rx():
+                    raise RuntimeError('Receiver did not acknowledge RX start')
+                self._rx_active = True
+                self.running = True
+            commands = bytearray()
+            last_log = time.monotonic()
+            while self.running and not self._stop_requested.is_set():
+                ready, _, _ = select.select([client], [], [], 0)
+                if ready:
+                    data = client.recv(1024)
+                    if not data:
                         break
-                except (ConnectionResetError, OSError):
-                    break
-
+                    commands.extend(data)
+                    while len(commands) >= 5 and not self._stop_requested.is_set():
+                        self.handle_rtl_command(bytes(commands[:5]))
+                        del commands[:5]
+                with self._device_lock:
+                    if not self.running:
+                        break
+                    raw = self.device.read_raw(512, timeout=0.02)
+                if raw:
+                    iq = bytearray(len(raw) * 2)
+                    iq[::2] = raw
+                    iq[1::2] = b'\x7f' * len(raw)
+                    client.sendall(iq)
+                    sample_count += len(raw)
+                else:
+                    client.sendall(b'\x7f\x7f' * 64)
+                if time.monotonic() - last_log >= 5:
+                    self.log(f'  Streamed {sample_count} demodulated samples')
+                    last_log = time.monotonic()
+        except (OSError, RuntimeError) as error:
+            self.log(f'Client session ended: {error}')
         finally:
             self.running = False
-            if stream_t.is_alive():
-                stream_t.join(timeout=2.0)
+            with self._device_lock:
+                try:
+                    self._stop_rx()
+                except Exception as error:
+                    self.log(f'Receiver cleanup failed: {error}')
+                    self.device.close()
+                    self._rx_active = False
             try:
                 client.close()
             except Exception:
                 pass
             self.client = None
-            self.log('URH disconnected — ready for next connection.')
+            self.log(f'URH disconnected ({sample_count} demodulated samples).')
 
     def run(self):
         """Main entry point: connect device, start server, accept clients."""
         if not self.connect_device():
             return False
         if not self.start_server():
+            self.cleanup()
             return False
 
         self.log('Bridge ready. Waiting for URH...')
         try:
-            while True:
-                client, addr = self.server.accept()
+            while not self._stop_requested.is_set():
+                try:
+                    client, addr = self.server.accept()
+                except socket.timeout:
+                    continue
                 self.handle_client(client, addr)
                 self.log('Ready for next connection...')
         except KeyboardInterrupt:
@@ -299,8 +253,18 @@ class URHBridge:
         finally:
             self.cleanup()
 
-    def cleanup(self):
+    def request_stop(self):
+        """Cancel startup or an active client without blocking the GUI thread."""
+        self._stop_requested.set()
         self.running = False
+        if self.client:
+            try:
+                self.client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def cleanup(self):
+        self.request_stop()
         if self.client:
             try:
                 self.client.close()
@@ -311,12 +275,10 @@ class URHBridge:
                 self.server.close()
             except Exception:
                 pass
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(b'rx_stop\n')
-                self.ser.close()
-            except Exception:
-                pass
+        with self._device_lock:
+            if self.device:
+                self.device.close()
+            self._rx_active = False
         self.log('Cleanup done.')
 
 

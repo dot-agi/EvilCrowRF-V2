@@ -38,10 +38,12 @@ except ImportError:
     )
 
 import threading
-import queue
 import time
 import argparse
 import sys
+from pathlib import Path
+from serial_utils import detect_evilcrow_port
+from evilcrow_sdr import EvilCrowSDR
 
 log = logging.getLogger(__name__)
 
@@ -55,17 +57,10 @@ except ImportError:
 
 
 def find_serial_port() -> str:
-    """Auto-detect EvilCrow serial port."""
-    for p in serial.tools.list_ports.comports():
-        desc = (p.description or '').lower()
-        if any(c in desc for c in ['cp210', 'ch340', 'ch9102', 'ftdi']):
-            return p.device
-        if (p.vid or 0) == 0x10C4:
-            return p.device
-    ports = serial.tools.list_ports.comports()
-    if ports:
-        return ports[0].device
-    raise RuntimeError('No serial ports found')
+    port = detect_evilcrow_port()
+    if port:
+        return port
+    raise RuntimeError('Specify --port; a single USB UART could not be identified')
 
 
 class EvilCrowSource:
@@ -84,136 +79,108 @@ class EvilCrowSource:
 
         self.ser: serial.Serial = None
         self.connected = False
+        self.device = None
         self.streaming = False
-        self.sample_queue: queue.Queue = queue.Queue(maxsize=20000)
-        self._thread: threading.Thread = None
+        self._lock = threading.RLock()
 
     def connect(self) -> bool:
         """Connect to device, auto-enable SDR mode, and configure."""
         try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            time.sleep(1.5)
-            self.ser.reset_input_buffer()
-
-            # Auto-enable SDR mode via serial (no app/phone needed)
-            self.ser.write(b'sdr_enable\n')
-            time.sleep(0.5)
-            while self.ser.in_waiting:
-                self.ser.read(self.ser.in_waiting)
-
-            self.ser.write(b'board_id_read\n')
-            time.sleep(0.3)
-            resp = b''
-            while self.ser.in_waiting:
-                resp += self.ser.read(self.ser.in_waiting)
-
-            if b'HACKRF' not in resp.upper():
-                print(f'[ERR] Not an EvilCrow SDR device')
-                return False
-
+            self.device = EvilCrowSDR(self.port, self.baudrate)
+            self.ser = self.device.ser
             self.connected = True
             print(f'[OK] Connected to EvilCrow SDR on {self.port}')
 
             # Apply settings
-            self.set_frequency(self.frequency)
-            self.set_modulation(self.modulation)
+            if not (self.set_frequency(self.frequency) and self.set_modulation(self.modulation) and
+                    self.set_bandwidth(650) and self.device.set_data_rate(3793.72)):
+                raise RuntimeError('Receiver configuration was not acknowledged')
 
             return True
         except Exception as e:
             print(f'[ERR] Connect failed: {e}')
+            self.close()
             return False
 
-    def set_frequency(self, freq_hz: float):
+    def _configure(self, operation) -> bool:
+        with self._lock:
+            if not self.connected:
+                return False
+            resume = self.streaming
+            if resume:
+                self.stop_streaming()
+            try:
+                result = operation()
+            except Exception:
+                if resume:
+                    try:
+                        if not self.start_streaming():
+                            log.error('Receiver did not acknowledge RX restart')
+                    except Exception:
+                        log.exception('Receiver restart also failed')
+                raise  # Preserve the original configuration failure.
+            if resume and not self.start_streaming():
+                raise RuntimeError('Receiver did not acknowledge RX restart')
+            return result
+
+    def set_frequency(self, freq_hz: float) -> bool:
         """Set center frequency."""
-        if self.connected:
-            self.ser.write(f'set_freq {int(freq_hz)}\n'.encode())
+        if self._configure(lambda: self.device.set_frequency(freq_hz)):
             self.frequency = freq_hz
-            time.sleep(0.1)
-            self.ser.reset_input_buffer()
+            return True
+        return False
 
-    def set_modulation(self, mod: int):
+    def set_modulation(self, mod: int) -> bool:
         """Set modulation (0=2FSK, 2=ASK/OOK, etc)."""
-        if self.connected:
-            self.ser.write(f'set_modulation {mod}\n'.encode())
+        name = {0: '2FSK', 1: 'GFSK', 2: 'ASK', 3: '4FSK', 4: 'MSK'}.get(mod)
+        if name is not None and self._configure(lambda: self.device.set_modulation(name)):
             self.modulation = mod
-            time.sleep(0.1)
-            self.ser.reset_input_buffer()
+            return True
+        return False
 
-    def set_bandwidth(self, bw_khz: float):
+    def set_bandwidth(self, bw_khz: float) -> bool:
         """Set RX bandwidth."""
-        if self.connected:
-            self.ser.write(f'set_bandwidth {bw_khz}\n'.encode())
-            time.sleep(0.1)
-            self.ser.reset_input_buffer()
+        return self._configure(lambda: self.device.set_bandwidth(bw_khz))
 
     def start_streaming(self) -> bool:
-        """Start RX and background read thread."""
-        if not self.connected:
-            return False
-        self.ser.write(b'rx_start\n')
-        time.sleep(0.2)
-        self.ser.reset_input_buffer()
-        self.streaming = True
-        self._thread = threading.Thread(target=self._read_worker, daemon=True)
-        self._thread.start()
-        print('[OK] RX streaming started')
-        return True
+        """Start RX through the shared library's single serial reader."""
+        with self._lock:
+            if not self.connected:
+                return False
+            if not self.streaming:
+                self.streaming = self.device.start_rx()
+            return self.streaming
 
-    def stop_streaming(self):
+    def stop_streaming(self) -> bool:
         """Stop RX."""
-        self.streaming = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        if self.connected:
-            self.ser.write(b'rx_stop\n')
-            time.sleep(0.1)
-        print('[OK] RX streaming stopped')
+        with self._lock:
+            if self.streaming:
+                acknowledged = self.device.stop_rx()
+                self.streaming = False
+                if not acknowledged:
+                    raise RuntimeError('RX stop was not acknowledged; restart the device')
+            return True
 
-    def _read_worker(self):
-        """Background: read serial bytes and enqueue as complex samples."""
-        while self.streaming and self.ser and self.ser.is_open:
-            try:
-                avail = self.ser.in_waiting
-                if avail > 0:
-                    data = self.ser.read(min(avail, 512))
-                    for b in data:
-                        # Convert demodulated byte to complex float.
-                        # Normalize 0-255 to -1.0..+1.0 range.
-                        sample = complex((b - 128) / 128.0, 0.0)
-                        try:
-                            self.sample_queue.put_nowait(sample)
-                        except queue.Full:
-                            try:
-                                self.sample_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                            self.sample_queue.put_nowait(sample)
-                else:
-                    time.sleep(0.002)
-            except Exception:
-                break
-
-    def read_samples(self, count: int) -> np.ndarray:
-        """Read N complex samples (blocking)."""
-        samples = []
-        deadline = time.time() + 2.0
-        while len(samples) < count and time.time() < deadline:
-            try:
-                s = self.sample_queue.get(timeout=0.05)
-                samples.append(s)
-            except queue.Empty:
-                continue
-        if not samples:
-            return np.zeros(count, dtype=np.complex64)
-        return np.array(samples[:count], dtype=np.complex64)
+    def read_samples(self, count: int, timeout: float = 2.0) -> np.ndarray:
+        """Read up to N received bytes and convert to complex samples."""
+        with self._lock:
+            if not self.connected or not self.streaming:
+                return np.empty(0, dtype=np.complex64)
+            data = self.device.read_raw(count, timeout=timeout)
+        amplitudes = (np.frombuffer(data, dtype=np.uint8).astype(np.float32) - 128) / 128
+        return amplitudes.astype(np.complex64)
 
     def close(self):
         """Clean up."""
-        if self.streaming:
-            self.stop_streaming()
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-        print('[OK] Disconnected')
+        with self._lock:
+            try:
+                if self.streaming:
+                    self.stop_streaming()
+            finally:
+                if self.device:
+                    self.device.close()
+                self.streaming = False
+                self.connected = False
 
 
 # ── GNU Radio Block ────────────────────────────────────────────
@@ -246,8 +213,9 @@ if HAS_GNURADIO:
 
         def start(self):
             if self.source.connect():
-                self.source.start_streaming()
-                return True
+                if self.source.start_streaming():
+                    return True
+                self.source.close()
             return False
 
         def stop(self):
@@ -259,13 +227,15 @@ if HAS_GNURADIO:
             n = len(out)
             samples = self.source.read_samples(n)
             out[:len(samples)] = samples
-            if len(samples) < n:
-                out[len(samples):] = 0
-            return n
+            return len(samples)
 
         def _handle_freq(self, msg):
             if pmt.is_number(msg):
-                self.source.set_frequency(pmt.to_double(msg))
+                try:
+                    if not self.source.set_frequency(pmt.to_double(msg)):
+                        log.error('Receiver rejected the frequency update')
+                except Exception:
+                    log.exception('Frequency update failed; check receiver state before restarting')
 
 
 # ── GRC XML block definition ──────────────────────────────────
@@ -321,20 +291,36 @@ Parameters:
 
 # ── Standalone test ────────────────────────────────────────────
 
-def standalone_test(port: str, freq: float, duration: float):
+def standalone_test(port: str, freq: float, duration: float, output=None, cancel_event=None):
     """Run a standalone capture test (no GNU Radio needed)."""
     print(f'\n=== EvilCrow SDR Standalone Test ===')
     print(f'Port: {port}  Freq: {freq/1e6:.2f} MHz  Duration: {duration}s\n')
 
+    outfile = Path(output) if output is not None else Path(f'capture_{freq/1e6:.0f}MHz.raw')
+    if outfile.exists():
+        raise FileExistsError('Capture output already exists; choose a new filename')
     source = EvilCrowSource(port, frequency=freq, modulation=2)
-    if not source.connect():
-        return
-
-    source.start_streaming()
-    time.sleep(duration)
-
-    samples = source.read_samples(2048)
-    source.close()
+    chunks = []
+    try:
+        if not source.connect():
+            raise RuntimeError('Could not connect and configure the receiver')
+        if cancel_event is not None and cancel_event.is_set():
+            return {'captured_samples': 0, 'output': None}
+        if not source.start_streaming():
+            raise RuntimeError('Receiver did not acknowledge start RX')
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline and (cancel_event is None or not cancel_event.is_set()):
+            samples = source.read_samples(2048, timeout=min(0.1, deadline - time.monotonic()))
+            if len(samples):
+                chunks.append(samples)
+        source.stop_streaming()
+    finally:
+        source.close()
+    if not chunks:
+        if cancel_event is not None and cancel_event.is_set():
+            return {'captured_samples': 0, 'output': None}
+        raise RuntimeError('No samples received; capture was not saved')
+    samples = np.concatenate(chunks)
 
     print(f'\nCaptured {len(samples)} samples')
     if len(samples) > 0:
@@ -344,9 +330,10 @@ def standalone_test(port: str, freq: float, duration: float):
         print(f'Peak amplitude: {peak:.4f}')
 
         # Save to file
-        outfile = f'capture_{freq/1e6:.0f}MHz.raw'
-        samples.tofile(outfile)
+        with outfile.open('xb') as destination:
+            samples.tofile(destination)
         print(f'Saved to {outfile} (complex64 format)')
+    return {'captured_samples': len(samples), 'output': str(outfile)}
 
 
 if __name__ == '__main__':

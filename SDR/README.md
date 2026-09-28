@@ -3,6 +3,9 @@
 
 # EvilCrow SDR — Quick Choices ⚡
 
+**macOS:** See [the macOS guide](../docs/macos.md) for the Flutter controller and USB backend,
+USB diagnostics, and the firmware fix required for SDR mode.
+
 ![screenshot](https://github.com/Senape3000/EvilCrowRF-V2/blob/main/docs/media/img/sdr_launcher.PNG?raw=true)
   ***
 

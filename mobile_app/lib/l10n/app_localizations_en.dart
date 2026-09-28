@@ -1612,7 +1612,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get hwButtonsDesc =>
-      'Assign an action to each physical button on the device. Press \"Send to Device\" to apply.';
+      'Choose an action for Button 1 or Button 2 while connected. Changes are sent immediately and saved on the device. RESET always restarts the chip and cannot be remapped.';
 
   @override
   String get button1Gpio34 => 'Button 1 (GPIO34)';

@@ -19,6 +19,7 @@ import sys
 import os
 import threading
 import time
+from serial_utils import detect_evilcrow_port
 
 # Version info
 VERSION = "1.0.2"
@@ -35,7 +36,7 @@ except ImportError:
 
 try:
     import tkinter as tk
-    from tkinter import ttk, scrolledtext, messagebox
+    from tkinter import ttk, scrolledtext, messagebox, filedialog
     HAS_TK = True
 except ImportError:
     HAS_TK = False
@@ -50,18 +51,6 @@ def list_serial_ports():
     return sorted(ports, key=lambda x: x[0])
 
 
-def detect_evilcrow_port():
-    """Try to find the EvilCrow port automatically."""
-    for p in serial.tools.list_ports.comports():
-        desc = (p.description or '').lower()
-        vid = p.vid or 0
-        if any(c in desc for c in ['cp210', 'ch340', 'ch9102', 'ftdi']):
-            return p.device
-        if vid == 0x10C4:
-            return p.device
-    return None
-
-
 # ── CLI Mode ───────────────────────────────────────────────────
 
 def run_cli():
@@ -73,7 +62,7 @@ def run_cli():
     parser.add_argument('--port', type=str, default=None,
                         help='Serial port (auto-detect if omitted)')
     parser.add_argument('--tool', type=str,
-                        choices=['library', 'urh', 'gnuradio', 'spectrum'],
+                        choices=['library', 'urh', 'gnuradio', 'status', 'spectrum'],
                         help='Tool to launch')
     parser.add_argument('--freq', type=float, default=433.92e6,
                         help='Frequency in Hz (default: 433.92 MHz)')
@@ -96,22 +85,22 @@ def run_cli():
     elif args.tool == 'gnuradio':
         from gnuradio_source import standalone_test
         standalone_test(port, args.freq, 10.0)
-    elif args.tool == 'spectrum':
-        run_spectrum_scan(port, args.freq)
+    elif args.tool in ('status', 'spectrum'):
+        run_device_status(port)
     elif args.tool == 'library':
         run_library_demo(port, args.freq)
     else:
         print('Please specify --tool (library, urh, gnuradio, spectrum)')
 
 
-def run_spectrum_scan(port: str, center_freq: float):
-    """Quick spectrum scan around center frequency."""
+def run_device_status(port: str):
+    """Read device identity and status without entering SDR mode."""
     from evilcrow_sdr import EvilCrowSDR
 
-    with EvilCrowSDR(port) as sdr:
-        sdr.set_frequency(center_freq)
-        sdr.set_modulation('ASK')
-        print(f'\nScanning around {center_freq/1e6:.2f} MHz...')
+    with EvilCrowSDR(port, auto_enable=False) as sdr:
+        print(sdr.get_device_info())
+        print('\nDevice status:')
+        print('Spectrum RSSI plots are available in the Bluetooth controller.')
         status = sdr.get_status()
         for k, v in status.items():
             print(f'  {k}: {v}')
@@ -123,19 +112,24 @@ def run_library_demo(port: str, freq: float):
 
     print('=== EvilCrow SDR Interactive Demo ===')
     with EvilCrowSDR(port) as sdr:
-        sdr.set_frequency(freq)
-        sdr.set_modulation('ASK')
-        sdr.set_bandwidth(650)
+        if not sdr.set_frequency(freq):
+            raise RuntimeError('Receiver frequency was not acknowledged')
+        if not sdr.set_modulation('ASK'):
+            raise RuntimeError('Receiver modulation was not acknowledged')
+        if not sdr.set_bandwidth(650):
+            raise RuntimeError('Receiver bandwidth was not acknowledged')
 
         print('\nDevice status:')
         for k, v in sdr.get_status().items():
             print(f'  {k}: {v}')
 
         print('\nStarting RX for 5 seconds...')
-        sdr.start_rx()
+        if not sdr.start_rx():
+            raise RuntimeError('The device could not start RX')
         time.sleep(5)
         data = sdr.read_raw(1024, timeout=1.0)
-        sdr.stop_rx()
+        if not sdr.stop_rx():
+            raise RuntimeError('RX stop was not acknowledged; restart the device')
 
         print(f'Received {len(data)} bytes')
         if data:
@@ -154,8 +148,8 @@ class SDRLauncherGUI:
          'RTL-TCP server for Universal Radio Hacker (localhost:1234)'),
         ('GNU Radio Capture', 'gnuradio',
          'Standalone capture test (saves .raw file)'),
-        ('Spectrum Status', 'spectrum',
-         'Quick device status and configuration check'),
+        ('Device Status', 'status',
+         'Read identity and status without enabling SDR'),
     ]
 
     # Common ISM / sub-GHz frequency presets
@@ -197,12 +191,30 @@ class SDRLauncherGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f'EvilCrow RF v2 — SDR Launcher v{VERSION}')
-        self.root.geometry('720x560')
-        self.root.resizable(False, False)
+        self.root.geometry('900x640')
+        self.root.minsize(780, 560)
         self.root.configure(bg='#0a0f0a')
 
-        self._running_thread = None
+        self._running_threads = []
+        self._bridge = None
+        self._closing = False
+        self._firmware_operation = False
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        if sys.platform == 'darwin':
+            self.root.createcommand('tk::mac::Quit', self._on_close)
         self._build_ui()
+        menu = tk.Menu(self.root)
+        device_menu = tk.Menu(menu, tearoff=False)
+        device_menu.add_command(label='Read Device Status', command=self._launch_status)
+        device_menu.add_separator()
+        for label, action in [('Enter Bootloader', 'bootloader'),
+                              ('Restart Device', 'reboot'),
+                              ('Back Up Flash…', 'backup'),
+                              ('Flash Firmware…', 'flash')]:
+            device_menu.add_command(label=label,
+                                    command=lambda action=action: self._firmware_action(action))
+        menu.add_cascade(label='Device', menu=device_menu)
+        self.root.configure(menu=menu)
 
     def _build_ui(self):
         # Style
@@ -269,16 +281,14 @@ class SDRLauncherGUI:
         tcp_entry = ttk.Entry(freq_frame, textvariable=self.tcp_var, width=8)
         tcp_entry.pack(side=tk.LEFT, padx=8)
 
-        # Tool selection (checkboxes for multi-tool)
-        ttk.Label(main, text='Tools (select one or more):').pack(
+        # A serial port has one owner at a time.
+        ttk.Label(main, text='Tool (one at a time per device):').pack(
             anchor=tk.W, pady=(4, 2))
 
-        self.tool_vars = {}
+        self.tool_var = tk.StringVar(value='status')
         for label, value, desc in self.TOOLS:
-            var = tk.BooleanVar(value=(value == 'library'))
-            self.tool_vars[value] = var
-            cb = ttk.Checkbutton(main, text=f'{label}  \u2014  {desc}',
-                                 variable=var,
+            cb = ttk.Radiobutton(main, text=f'{label}  \u2014  {desc}',
+                                 variable=self.tool_var, value=value,
                                  style='Tool.TRadiobutton')
             cb.pack(anchor=tk.W, padx=16, pady=1)
 
@@ -302,6 +312,18 @@ class SDRLauncherGUI:
 
         ttk.Button(btn_frame, text='Clear Log',
                    command=self._clear_log).pack(side=tk.RIGHT)
+
+        firmware_frame = ttk.Frame(main)
+        firmware_frame.pack(fill=tk.X, pady=(4, 4))
+        self._firmware_buttons = []
+        for label, action in [('Enter bootloader', 'bootloader'),
+                              ('Restart device', 'reboot'),
+                              ('Back up flash', 'backup'),
+                              ('Flash firmware…', 'flash')]:
+            button = ttk.Button(firmware_frame, text=label,
+                                command=lambda action=action: self._firmware_action(action))
+            button.pack(side=tk.LEFT, padx=(0, 8))
+            self._firmware_buttons.append(button)
 
         # Output log
         self.log_text = scrolledtext.ScrolledText(
@@ -337,8 +359,10 @@ class SDRLauncherGUI:
                 if name == auto:
                     self.port_combo.current(i)
                     break
-        elif display:
+        elif len(display) == 1:
             self.port_combo.current(0)
+        else:
+            self.port_var.set('')
 
     def _get_selected_port(self) -> str:
         """Get actual port name from combobox selection."""
@@ -362,6 +386,10 @@ class SDRLauncherGUI:
 
     def _install_deps(self):
         """Install Python dependencies from requirements.txt."""
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo('Dependencies',
+                                'This app already includes its Python dependencies.')
+            return
         self._log('Installing dependencies (pyserial, numpy)...')
 
         def _do_install():
@@ -426,22 +454,30 @@ class SDRLauncherGUI:
 
     def _launch(self):
         """Launch selected tool(s) in background thread(s)."""
+        if any(thread.is_alive() for thread in self._running_threads):
+            return
         port = self._get_selected_port()
         if not port:
             messagebox.showwarning('No Port', 'Select a serial port first.')
             return
 
-        # Collect selected tools
-        selected = [key for key, var in self.tool_vars.items() if var.get()]
-        if not selected:
-            messagebox.showwarning('No Tool', 'Select at least one tool.')
+        selected = [self.tool_var.get()]
+        from evilcrow_sdr import is_valid_frequency
+        try:
+            freq = float(self.freq_var.get()) * 1e6
+            tcp_port = int(self.tcp_var.get())
+            if not is_valid_frequency(freq) or not 1 <= tcp_port <= 65535:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning('Invalid settings',
+                                   'Use a frequency in 300–348, 387–464, or 779–928 MHz '
+                                   'and a TCP port from 1 to 65535.')
             return
-
-        freq = float(self.freq_var.get()) * 1e6
-        tcp_port = int(self.tcp_var.get())
 
         self.launch_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        for button in self._firmware_buttons:
+            button.config(state=tk.DISABLED)
 
         self._stop_flag = False
         self._running_threads = []
@@ -459,8 +495,97 @@ class SDRLauncherGUI:
     def _stop(self):
         """Request stop for running tool."""
         self._stop_flag = True
+        if self._bridge:
+            self._bridge.request_stop()
         self._log('Stop requested...')
         self.stop_btn.config(state=tk.DISABLED)
+
+    def _on_close(self):
+        if any(thread.is_alive() for thread in self._running_threads):
+            self._closing = True
+            if self._firmware_operation:
+                self._log('Waiting for the firmware operation to finish before closing...')
+            else:
+                self._stop()
+                self._log('Waiting for receiver cleanup before closing...')
+        else:
+            self.root.destroy()
+
+    def _firmware_action(self, action):
+        if any(thread.is_alive() for thread in self._running_threads):
+            return
+        port = self._get_selected_port()
+        if not port:
+            messagebox.showwarning('No Port', 'Select the EvilCrow USB serial port first.')
+            return
+        try:
+            import firmware_tool
+            if action == 'backup':
+                output = filedialog.asksaveasfilename(
+                    title='Save full flash backup', defaultextension='.bin',
+                    initialfile=f'evilcrow-backup-{time.strftime("%Y%m%d-%H%M%S")}.bin')
+                if not output:
+                    return
+                operation = lambda: firmware_tool.backup_flash(port, output)
+            elif action == 'flash':
+                firmware = filedialog.askopenfilename(
+                    title='Choose application firmware.bin',
+                    filetypes=[('Firmware', '*.bin'), ('All files', '*')])
+                if not firmware:
+                    return
+                backup = filedialog.askopenfilename(
+                    title='Choose verified full flash backup (.sha256 must be alongside it)',
+                    filetypes=[('Flash backup', '*.bin'), ('All files', '*')])
+                if not backup:
+                    return
+                plan, _, _ = firmware_tool.prepare_flash(firmware, backup)
+                part = plan['partition']
+                if not messagebox.askyesno('Install firmware',
+                        f'Firmware: {os.path.basename(firmware)}\n'
+                        f'Size: {plan["firmware_bytes"]:,} bytes\n'
+                        f'SHA-256: {plan["sha256"]}\n'
+                        f'Application: {part["name"]} at 0x{part["offset"]:06x}\n\n'
+                        'The installed application must match the backup. '
+                        'Settings and storage are preserved. Bluetooth will disconnect. '
+                        'Keep USB connected until verification finishes.\n\nInstall this firmware?'):
+                    return
+                operation = lambda: firmware_tool.flash_firmware(
+                    port, firmware, backup, confirmed=True,
+                    expected_sha256=plan['sha256'])
+            elif action == 'bootloader':
+                operation = lambda: firmware_tool.enter_bootloader(port)
+            else:
+                operation = lambda: firmware_tool.restart_device(port)
+        except Exception as error:
+            messagebox.showerror('Firmware operation', str(error))
+            return
+        self._firmware_operation = True
+        self.launch_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
+        for button in self._firmware_buttons:
+            button.config(state=tk.DISABLED)
+        self._log(f'[{action}] Using {port}. Bluetooth disconnects during bootloader operations.')
+        worker = threading.Thread(target=self._run_firmware, args=(operation,), daemon=True)
+        self._running_threads = [worker]
+        worker.start()
+        threading.Thread(target=self._monitor_threads, daemon=True).start()
+
+    def _launch_status(self):
+        if not any(thread.is_alive() for thread in self._running_threads):
+            self.tool_var.set('status')
+            self._launch()
+
+    def _run_firmware(self, operation):
+        old_stdout = sys.stdout
+        sys.stdout = _LogWriter(self._log)
+        try:
+            operation()
+        except Exception as error:
+            self._log(f'[Firmware] ERROR: {error}')
+        finally:
+            sys.stdout.flush()
+            sys.stdout = old_stdout
+            self._log('[Firmware] Finished.')
 
     def _run_tool(self, tool: str, port: str, freq: float, tcp_port: int):
         """Run the selected tool (called in background thread)."""
@@ -477,9 +602,12 @@ class SDRLauncherGUI:
                 self._log(f'[URH] Starting bridge on {port}, TCP :{tcp_port}...')
                 from urh_bridge import URHBridge
                 bridge = URHBridge(serial_port=port, tcp_port=tcp_port)
+                self._bridge = bridge
                 if not bridge.connect_device():
                     self._log('[URH] Failed to connect device.')
                     return
+                if not bridge.device.set_frequency(freq):
+                    raise RuntimeError('Failed to set receiver frequency')
                 if not bridge.start_server():
                     self._log('[URH] Failed to start TCP server.')
                     return
@@ -501,19 +629,28 @@ class SDRLauncherGUI:
                 from gnuradio_source import standalone_test
                 standalone_test(port, freq, 10.0)
 
-            elif tool == 'spectrum':
-                self._log(f'[Spectrum] Checking status on {port}...')
-                run_spectrum_scan(port, freq)
+            elif tool == 'status':
+                self._log(f'[Status] Checking {port}...')
+                run_device_status(port)
 
         except Exception as e:
             self._log(f'[{tool}] ERROR: {e}')
         finally:
+            if tool == 'urh' and self._bridge:
+                self._bridge.cleanup()
+                self._bridge = None
             sys.stdout = old_stdout
             self._log(f'[{tool}] Finished.')
 
     def _on_tool_done(self):
+        self._firmware_operation = False
+        if self._closing:
+            self.root.destroy()
+            return
         self.launch_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        for button in self._firmware_buttons:
+            button.config(state=tk.NORMAL)
 
     def _monitor_threads(self):
         """Wait for all running threads to finish, then re-enable launch."""
@@ -544,6 +681,9 @@ class _LogWriter:
             self._log(self._buf.strip())
             self._buf = ''
 
+    def isatty(self):
+        return False
+
 
 # ── Entry Point ────────────────────────────────────────────────
 
@@ -551,7 +691,15 @@ import socket  # needed by URH tool in thread
 
 if __name__ == '__main__':
     # If command-line args provided, run in CLI mode
-    if len(sys.argv) > 1 and '--tool' in sys.argv:
+    if len(sys.argv) > 1 and sys.argv[1] == '--backend':
+        sys.argv.pop(1)
+        from usb_backend import main
+        raise SystemExit(main())
+    elif len(sys.argv) > 1 and sys.argv[1] == '--firmware-tool':
+        sys.argv.pop(1)
+        from firmware_tool import main
+        main()
+    elif len(sys.argv) > 1 and '--tool' in sys.argv:
         run_cli()
     elif HAS_TK:
         app = SDRLauncherGUI()
