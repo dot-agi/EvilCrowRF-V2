@@ -805,6 +805,10 @@ void loop()
     // Poll SDR raw RX streaming (reads CC1101 FIFO and sends via serial/BLE)
     if (SdrModule::isActive() && SdrModule::isStreaming()) {
         SdrModule::pollRawRx();
+        // SerialCmd has the same priority as this loop. After poll releases
+        // its output mutex, let a waiting stop command take it before we poll
+        // again; BLE notification delays otherwise let this loop reacquire it.
+        taskYIELD();
     }
 #endif
 
